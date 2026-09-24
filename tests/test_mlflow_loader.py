@@ -26,7 +26,7 @@ def test_mlflow_loader_loads_resolved_version_when_alias_changes_and_retains_met
     fake_mlflow = SimpleNamespace(
         set_tracking_uri=lambda uri: calls.append(("tracking_uri", uri)),
         MlflowClient=FakeMlflowClient,
-        pyfunc=SimpleNamespace(
+        sklearn=SimpleNamespace(
             load_model=lambda uri: calls.append(("load", uri)) or loaded_model,
         ),
     )
@@ -55,9 +55,15 @@ def test_lifespan_loads_each_model_once_and_requests_do_not_call_mlflow(
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
     calls: list[tuple[str, str]] = []
 
+    class FakeModel:
+        classes_ = (0, 1)
+
+        def predict_proba(self, _: list[list[object]]) -> list[list[float]]:
+            return [[0.3, 0.7]]
+
     def fake_loader(entry: object, tracking_uri: str) -> object:
         calls.append((entry.registered_model, tracking_uri))
-        return SimpleNamespace(model=object(), model_version="7", run_id="run-123")
+        return SimpleNamespace(model=FakeModel(), model_version="7", run_id="run-123")
 
     monkeypatch.setattr(application, "load_model_from_mlflow", fake_loader)
 
@@ -65,7 +71,21 @@ def test_lifespan_loads_each_model_once_and_requests_do_not_call_mlflow(
         assert client.get("/models/invoice-review/health").status_code == 503
         assert client.get("/models/invoice-review/health").status_code == 503
         assert client.get("/models").json() == {"models": ["invoice-review"]}
+        predict_response = client.post(
+            "/models/invoice-review/predict",
+            json={
+                "invoice_amount_cents": 125000,
+                "vendor_tenure_days": 365,
+                "previous_incidents_12m": 1,
+                "amount_vs_vendor_median": 1.25,
+                "has_purchase_order": True,
+                "three_way_match": True,
+                "bank_account_recently_changed": False,
+                "country_risk": "CL",
+            },
+        )
 
+    assert predict_response.status_code == 200
     assert calls == [("invoice-review-production", "https://mlflow.example.test")]
 
 
@@ -156,7 +176,7 @@ def test_incomplete_mlflow_metadata_degrades_registered_model(
     fake_mlflow = SimpleNamespace(
         set_tracking_uri=lambda _: None,
         MlflowClient=FakeMlflowClient,
-        pyfunc=SimpleNamespace(load_model=lambda _: object()),
+        sklearn=SimpleNamespace(load_model=lambda _: object()),
     )
     monkeypatch.setitem(sys.modules, "mlflow", fake_mlflow)
 
@@ -167,7 +187,7 @@ def test_incomplete_mlflow_metadata_degrades_registered_model(
     assert response.json()["detail"]["message"] == "Model loader is unavailable"
 
 
-def test_loaded_model_routes_remain_unavailable_before_api_04_and_api_05(
+def test_loaded_model_health_remains_unavailable_before_api_04(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
@@ -179,14 +199,8 @@ def test_loaded_model_routes_remain_unavailable_before_api_04_and_api_05(
 
     with TestClient(application.create_app()) as client:
         health_response = client.get("/models/invoice-review/health")
-        predict_response = client.post(
-            "/models/invoice-review/predict",
-            json={"payload": {"invoice_id": "inv-1"}},
-        )
 
     assert health_response.status_code == 503
     assert health_response.json() == {
         "detail": "Model health is unavailable until API-04"
     }
-    assert predict_response.status_code == 503
-    assert predict_response.json() == {"detail": "Inference is unavailable until API-05"}

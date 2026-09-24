@@ -2,9 +2,10 @@ import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from math import isfinite
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,7 @@ def load_model_from_mlflow(
     run_id = getattr(model_version, "run_id", None)
     if not version or not run_id:
         raise ValueError("MLflow model version metadata is incomplete")
-    model = mlflow.pyfunc.load_model(
+    model = mlflow.sklearn.load_model(
         f"models:/{catalog_entry.registered_model}/{version}"
     )
     return LoadedModel(model=model, model_version=str(version), run_id=str(run_id))
@@ -92,7 +93,48 @@ def create_app() -> FastAPI:
 
 
 class PredictRequest(BaseModel):
-    payload: dict[str, object]
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    invoice_amount_cents: int
+    vendor_tenure_days: int
+    previous_incidents_12m: int
+    amount_vs_vendor_median: float
+    has_purchase_order: bool
+    three_way_match: bool
+    bank_account_recently_changed: bool
+    country_risk: str
+
+    def as_training_features(self) -> list[object]:
+        return [
+            self.invoice_amount_cents,
+            self.vendor_tenure_days,
+            self.previous_incidents_12m,
+            self.amount_vs_vendor_median,
+            self.has_purchase_order,
+            self.three_way_match,
+            self.bank_account_recently_changed,
+            self.country_risk,
+        ]
+
+
+class PredictResponse(BaseModel):
+    model_id: str
+    model_version: str
+    run_id: str
+    probability: float
+
+
+def positive_class_probability(model: object, features: list[object]) -> float:
+    probabilities = model.predict_proba([features])
+    classes = list(model.classes_)
+    positive_class_index = classes.index(1)
+    rows = list(probabilities)
+    if len(rows) != 1:
+        raise ValueError("Model returned an unexpected number of predictions")
+    probability = float(list(rows[0])[positive_class_index])
+    if not isfinite(probability) or not 0 <= probability <= 1:
+        raise ValueError("Model returned an invalid probability")
+    return probability
 
 
 @router.get("/health")
@@ -123,13 +165,25 @@ def model_health(model_id: str, request: Request) -> None:
     raise HTTPException(status_code=503, detail="Model health is unavailable until API-04")
 
 
-@router.post("/models/{model_id}/predict")
-def predict(model_id: str, request: PredictRequest, app_request: Request) -> None:
+@router.post("/models/{model_id}/predict", response_model=PredictResponse)
+def predict(
+    model_id: str, request: PredictRequest, app_request: Request
+) -> PredictResponse:
     if model_id not in MODEL_CATALOG:
         raise HTTPException(status_code=404, detail="Model not found")
-    if app_request.app.state.model_registry[model_id] is None:
+    loaded_model = app_request.app.state.model_registry[model_id]
+    if loaded_model is None:
         raise HTTPException(status_code=503, detail="Model loader is unavailable")
-    raise HTTPException(status_code=503, detail="Inference is unavailable until API-05")
+    try:
+        probability = positive_class_probability(loaded_model.model, request.as_training_features())
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=503, detail="Model inference is unavailable") from None
+    return PredictResponse(
+        model_id=model_id,
+        model_version=loaded_model.model_version,
+        run_id=loaded_model.run_id,
+        probability=probability,
+    )
 
 
 app = create_app()

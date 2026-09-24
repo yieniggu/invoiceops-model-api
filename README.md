@@ -80,7 +80,8 @@ El contenedor no inicia sin `MLFLOW_TRACKING_URI`. Luego consulta
 | `invoice-review` | `invoice-review-production` | `champion` |
 
 - Un ID desconocido responde `404`. Un ID registrado que no pudo cargar responde `503`; el detalle de su respuesta de health incluye el ID lógico, el modelo registrado, el alias y un mensaje de loader no disponible. Fallas del proveedor, alias, metadata o carga degradan sólo el ID afectado y no exponen el error del proveedor.
-- `POST /models/{model_id}/predict` exige un body Pydantic con `payload` como objeto. Un body inválido responde el `422` estándar de FastAPI. Incluso con el modelo cargado, responde `503` hasta API-05; API-03 no ejecuta ni simula inferencia.
+- `POST /models/{model_id}/predict` exige exactamente las ocho features del artifact entrenado: `invoice_amount_cents`, `vendor_tenure_days`, `previous_incidents_12m`, `amount_vs_vendor_median`, `has_purchase_order`, `three_way_match`, `bank_account_recently_changed` y `country_risk`. Un body inválido responde el `422` estándar de FastAPI.
+- Una predicción exitosa usa únicamente el modelo activo ya cargado en memoria y devuelve `model_id`, `model_version`, `run_id` y `probability`. `probability` es la probabilidad finita de la clase positiva (`1`, revisión manual); no aplica thresholds, recomendaciones ni Business Policy. La solicitud no resuelve aliases, carga artifacts ni llama a MLflow. Una salida o falla de inferencia no válida responde `503` con un detalle genérico.
 - `GET /models/{model_id}/health` responde `503` incluso con el modelo cargado hasta API-04; API-03 no introduce un contrato exitoso para esa ruta. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
-- API-03 no agrega inferencia, refresco/swap de modelos ni endpoints administrativos. Esas extensiones pertenecen a hitos posteriores.
+- API-05 no agrega refresh/swap de modelos ni endpoints administrativos. Esas extensiones pertenecen a hitos posteriores.
 - Docker Compose, CI, despliegue cloud, el consumidor de la aplicación e INT-03 están fuera de alcance.
