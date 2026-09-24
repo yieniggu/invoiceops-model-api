@@ -1,7 +1,7 @@
 # InvoiceOps Model API
 
 Servicio HTTP mínimo para exponer modelos de InvoiceOps. Usa un catálogo local
-explícito de modelos y no se conecta a MLflow ni a servicios externos.
+explícito y carga sus modelos desde MLflow durante el inicio del proceso.
 
 ## Inicio rápido
 
@@ -9,6 +9,7 @@ Requiere Python 3.12 y [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync --all-groups
+export MLFLOW_TRACKING_URI="https://mlflow.example.internal"
 uv run uvicorn invoiceops_model_api.app:app --host 0.0.0.0 --port 8000
 ```
 
@@ -24,6 +25,29 @@ La respuesta esperada es:
 {"status":"ok"}
 ```
 
+## Configuración de MLflow
+
+`MLFLOW_TRACKING_URI` es obligatoria y no puede ser vacía o contener sólo
+espacios. Si falta o es inválida, el arranque falla cerrado: el proceso no queda
+operacional. El servicio sólo lee la configuración desde variables de entorno
+en el arranque; no acepta credenciales por HTTP ni desde archivos de configuración.
+
+La autenticación básica es opcional, pero `MLFLOW_TRACKING_USERNAME` y
+`MLFLOW_TRACKING_PASSWORD` forman un par atómico: ambas deben estar definidas o
+ambas ausentes. Una configuración parcial también falla cerrado al arrancar. No
+incluyas estos valores en el repositorio, imágenes, logs o respuestas HTTP.
+
+```bash
+export MLFLOW_TRACKING_URI="https://mlflow.example.internal"
+export MLFLOW_TRACKING_USERNAME="..."
+export MLFLOW_TRACKING_PASSWORD="..."
+```
+
+Por cada entrada del catálogo, el inicio resuelve su alias, retiene en memoria
+el objeto cargado junto con `model_version` y `run_id`, y carga la versión
+concreta resuelta mediante `models:/<modelo-registrado>/<versión>` una única
+vez. Las solicitudes normales no realizan llamadas a MLflow.
+
 ## Verificación local
 
 ```bash
@@ -38,10 +62,11 @@ Construye la imagen sin credenciales ni archivos de entorno:
 
 ```bash
 docker build -t invoiceops-model-api .
-docker run --rm -p 8000:8000 invoiceops-model-api
+docker run --rm -p 8000:8000 -e MLFLOW_TRACKING_URI="https://mlflow.example.internal" invoiceops-model-api
 ```
 
-Luego consulta `http://127.0.0.1:8000/health`.
+El contenedor no inicia sin `MLFLOW_TRACKING_URI`. Luego consulta
+`http://127.0.0.1:8000/health`.
 
 ## Alcance actual
 
@@ -54,8 +79,8 @@ Luego consulta `http://127.0.0.1:8000/health`.
 | --- | --- | --- |
 | `invoice-review` | `invoice-review-production` | `champion` |
 
-- Un ID desconocido responde `404`. Un ID registrado sin loader responde `503`; el detalle de su respuesta de health incluye el ID lógico, el modelo registrado, el alias y un mensaje de loader no disponible.
-- `POST /models/{model_id}/predict` exige un body Pydantic con `payload` como objeto. Un body inválido responde el `422` estándar de FastAPI.
-- No hay loader ni inferencia todavía, por lo que este hito no tiene respuesta exitosa de `predict`.
-- API-03 es responsable de la integración con MLflow, la resolución de alias y la carga de modelos. Este catálogo API-02 no se conecta a MLflow, no resuelve alias, no carga versiones de modelos ni IDs de ejecución, no realiza predicciones, no refresca estado, no lee credenciales ni entorno, ni realiza llamadas de red.
+- Un ID desconocido responde `404`. Un ID registrado que no pudo cargar responde `503`; el detalle de su respuesta de health incluye el ID lógico, el modelo registrado, el alias y un mensaje de loader no disponible. Fallas del proveedor, alias, metadata o carga degradan sólo el ID afectado y no exponen el error del proveedor.
+- `POST /models/{model_id}/predict` exige un body Pydantic con `payload` como objeto. Un body inválido responde el `422` estándar de FastAPI. Incluso con el modelo cargado, responde `503` hasta API-05; API-03 no ejecuta ni simula inferencia.
+- `GET /models/{model_id}/health` responde `503` incluso con el modelo cargado hasta API-04; API-03 no introduce un contrato exitoso para esa ruta. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
+- API-03 no agrega inferencia, refresco/swap de modelos ni endpoints administrativos. Esas extensiones pertenecen a hitos posteriores.
 - Docker Compose, CI, despliegue cloud, el consumidor de la aplicación e INT-03 están fuera de alcance.
