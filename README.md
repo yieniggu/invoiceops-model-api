@@ -1,6 +1,6 @@
 # InvoiceOps Model API
 
-Servicio HTTP mínimo para exponer modelos de InvoiceOps. Este primer hito sólo entrega un health check determinista; no se conecta a MLflow ni a servicios externos.
+Servicio HTTP mínimo para exponer modelos de InvoiceOps. Expone un registro local explícito de IDs lógicos, sin conectarse a MLflow ni a servicios externos.
 
 ## Inicio rápido
 
@@ -45,5 +45,9 @@ Luego consulta `http://127.0.0.1:8000/health`.
 ## Alcance actual
 
 - Incluye `GET /health`.
-- No incluye endpoints de modelos o predicción.
+- Incluye `GET /models`, que lista los IDs lógicos registrados. Actualmente el registro local contiene `invoice-review`.
+- Incluye las rutas genéricas `GET /models/{model_id}/health` y `POST /models/{model_id}/predict`; agregar un ID al registro no requiere agregar rutas FastAPI.
+- Un ID desconocido responde `404` y un ID registrado sin loader responde `503`.
+- `POST /models/{model_id}/predict` exige un body Pydantic con `payload` como objeto. Un body inválido responde el `422` estándar de FastAPI.
+- No hay loader ni inferencia todavía; por ello no existe respuesta exitosa de `predict` en este hito.
 - No incluye integración con MLflow, Model Registry, catálogo, credenciales, Docker Compose, CI ni despliegue cloud.
