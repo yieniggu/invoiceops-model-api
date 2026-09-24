@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from invoiceops_model_api.app import app
+from invoiceops_model_api.app import MODEL_CATALOG, app
 
 client = TestClient(app)
 
@@ -12,10 +12,26 @@ def test_models_lists_registered_logical_ids() -> None:
     assert response.json() == {"models": ["invoice-review"]}
 
 
+def test_invoice_review_catalog_maps_to_production_champion() -> None:
+    model = MODEL_CATALOG["invoice-review"]
+
+    assert model.registered_model == "invoice-review-production"
+    assert model.alias == "champion"
+    assert model.alias
+
+
 def test_registered_model_health_is_unavailable_without_loader() -> None:
     response = client.get("/models/invoice-review/health")
 
     assert response.status_code == 503
+    assert response.json() == {
+        "detail": {
+            "model_id": "invoice-review",
+            "registered_model": "invoice-review-production",
+            "alias": "champion",
+            "message": "Model loader is unavailable",
+        }
+    }
 
 
 def test_unknown_model_health_returns_not_found() -> None:
