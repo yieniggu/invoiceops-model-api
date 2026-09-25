@@ -53,6 +53,7 @@ def test_lifespan_loads_each_model_once_and_requests_do_not_call_mlflow(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
+    monkeypatch.setenv("MODEL_API_ADMIN_TOKEN", "test-admin-token")
     calls: list[tuple[str, str]] = []
 
     class FakeModel:
@@ -68,8 +69,8 @@ def test_lifespan_loads_each_model_once_and_requests_do_not_call_mlflow(
     monkeypatch.setattr(application, "load_model_from_mlflow", fake_loader)
 
     with TestClient(application.create_app()) as client:
-        assert client.get("/models/invoice-review/health").status_code == 503
-        assert client.get("/models/invoice-review/health").status_code == 503
+        assert client.get("/models/invoice-review/health").status_code == 200
+        assert client.get("/models/invoice-review/health").status_code == 200
         assert client.get("/models").json() == {"models": ["invoice-review"]}
         predict_response = client.post(
             "/models/invoice-review/predict",
@@ -133,6 +134,7 @@ def test_loader_failure_degrades_only_the_affected_model_without_leaking_error(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
+    monkeypatch.setenv("MODEL_API_ADMIN_TOKEN", "test-admin-token")
     monkeypatch.setattr(
         application,
         "MODEL_CATALOG",
@@ -154,7 +156,7 @@ def test_loader_failure_degrades_only_the_affected_model_without_leaking_error(
 
     with TestClient(application.create_app()) as client:
         response = client.get("/models/invoice-review/health")
-        assert client.get("/models/healthy/health").status_code == 503
+        assert client.get("/models/healthy/health").status_code == 200
         assert client.get("/health").json() == {"status": "ok"}
 
     assert response.status_code == 503
@@ -165,6 +167,7 @@ def test_incomplete_mlflow_metadata_degrades_registered_model(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
+    monkeypatch.setenv("MODEL_API_ADMIN_TOKEN", "test-admin-token")
 
     class FakeMlflowClient:
         def __init__(self, *, tracking_uri: str) -> None:
@@ -187,10 +190,11 @@ def test_incomplete_mlflow_metadata_degrades_registered_model(
     assert response.json()["detail"]["message"] == "Model loader is unavailable"
 
 
-def test_loaded_model_health_remains_unavailable_before_api_04(
+def test_loaded_model_health_reports_the_active_model_after_api_04(
     monkeypatch,
 ) -> None:
     monkeypatch.setenv("MLFLOW_TRACKING_URI", "https://mlflow.example.test")
+    monkeypatch.setenv("MODEL_API_ADMIN_TOKEN", "test-admin-token")
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
@@ -200,7 +204,11 @@ def test_loaded_model_health_remains_unavailable_before_api_04(
     with TestClient(application.create_app()) as client:
         health_response = client.get("/models/invoice-review/health")
 
-    assert health_response.status_code == 503
+    assert health_response.status_code == 200
     assert health_response.json() == {
-        "detail": "Model health is unavailable until API-04"
+        "model_id": "invoice-review",
+        "registered_model": "invoice-review-production",
+        "alias": "champion",
+        "model_version": "7",
+        "run_id": "run-123",
     }

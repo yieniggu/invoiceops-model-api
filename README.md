@@ -10,6 +10,7 @@ Requiere Python 3.12 y [uv](https://docs.astral.sh/uv/).
 ```bash
 uv sync --all-groups
 export MLFLOW_TRACKING_URI="https://mlflow.example.internal"
+export MODEL_API_ADMIN_TOKEN="..."
 uv run uvicorn invoiceops_model_api.app:app --host 0.0.0.0 --port 8000
 ```
 
@@ -43,6 +44,25 @@ export MLFLOW_TRACKING_USERNAME="..."
 export MLFLOW_TRACKING_PASSWORD="..."
 ```
 
+`MODEL_API_ADMIN_TOKEN` es obligatoria y protege exclusivamente el refresh
+administrativo. Debe proveerse sólo mediante el entorno de ejecución; si falta,
+es vacía o contiene sólo espacios, el proceso falla cerrado al iniciar. No la
+incluyas en el repositorio, imágenes, logs o respuestas HTTP.
+
+```bash
+export MODEL_API_ADMIN_TOKEN="..."
+```
+
+`MODEL_REFRESH_TIMEOUT_SECONDS` es opcional y define el límite del refresh
+administrativo completo; su valor por defecto es `30`. Debe ser un número finito
+positivo. El refresh carga en un proceso aislado: al vencer el límite, el proceso
+HTTP termina el hijo con una espera de limpieza acotada, conserva el modelo activo
+y responde `503`. La terminación no confirma ni informa una cancelación al proveedor.
+
+```bash
+export MODEL_REFRESH_TIMEOUT_SECONDS="30"
+```
+
 Por cada entrada del catálogo, el inicio resuelve su alias, retiene en memoria
 el objeto cargado junto con `model_version` y `run_id`, y carga la versión
 concreta resuelta mediante `models:/<modelo-registrado>/<versión>` una única
@@ -62,10 +82,13 @@ Construye la imagen sin credenciales ni archivos de entorno:
 
 ```bash
 docker build -t invoiceops-model-api .
-docker run --rm -p 8000:8000 -e MLFLOW_TRACKING_URI="https://mlflow.example.internal" invoiceops-model-api
+docker run --rm -p 8000:8000 \
+  -e MLFLOW_TRACKING_URI="https://mlflow.example.internal" \
+  -e MODEL_API_ADMIN_TOKEN="..." \
+  invoiceops-model-api
 ```
 
-El contenedor no inicia sin `MLFLOW_TRACKING_URI`. Luego consulta
+El contenedor no inicia sin `MLFLOW_TRACKING_URI` y `MODEL_API_ADMIN_TOKEN`. Luego consulta
 `http://127.0.0.1:8000/health`.
 
 ## Alcance actual
@@ -82,6 +105,6 @@ El contenedor no inicia sin `MLFLOW_TRACKING_URI`. Luego consulta
 - Un ID desconocido responde `404`. Un ID registrado que no pudo cargar responde `503`; el detalle de su respuesta de health incluye el ID lógico, el modelo registrado, el alias y un mensaje de loader no disponible. Fallas del proveedor, alias, metadata o carga degradan sólo el ID afectado y no exponen el error del proveedor.
 - `POST /models/{model_id}/predict` exige exactamente las ocho features del artifact entrenado: `invoice_amount_cents`, `vendor_tenure_days`, `previous_incidents_12m`, `amount_vs_vendor_median`, `has_purchase_order`, `three_way_match`, `bank_account_recently_changed` y `country_risk`. Un body inválido responde el `422` estándar de FastAPI.
 - Una predicción exitosa usa únicamente el modelo activo ya cargado en memoria y devuelve `model_id`, `model_version`, `run_id` y `probability`. `probability` es la probabilidad finita de la clase positiva (`1`, revisión manual); no aplica thresholds, recomendaciones ni Business Policy. La solicitud no resuelve aliases, carga artifacts ni llama a MLflow. Una salida o falla de inferencia no válida responde `503` con un detalle genérico.
-- `GET /models/{model_id}/health` responde `503` incluso con el modelo cargado hasta API-04; API-03 no introduce un contrato exitoso para esa ruta. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
-- API-05 no agrega refresh/swap de modelos ni endpoints administrativos. Esas extensiones pertenecen a hitos posteriores.
+- `GET /models/{model_id}/health` responde `200` cuando el modelo está activo y devuelve `model_id`, `registered_model`, `alias`, `model_version` y `run_id` realmente servidos. Un ID registrado sin carga sigue respondiendo `503`; un ID desconocido responde `404`. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
+- `POST /admin/models/{model_id}/refresh` exige el header `X-Model-Admin-Token` que coincida con `MODEL_API_ADMIN_TOKEN`. Resuelve y carga el champion actual en un proceso aislado antes de sustituir bajo lock la instancia activa. Las solicitudes predict/health sólo obtienen una instancia completa; timeout, salida anómala del hijo, error de transferencia o falla del proveedor conservan la versión anterior y responden `503` sin detalles del proveedor. Registra eventos seguros de intento, éxito o falla sin token, credenciales ni excepción cruda del proveedor.
 - Docker Compose, CI, despliegue cloud, el consumidor de la aplicación e INT-03 están fuera de alcance.
