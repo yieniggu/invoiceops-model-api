@@ -68,6 +68,35 @@ el objeto cargado junto con `model_version` y `run_id`, y carga la versión
 concreta resuelta mediante `models:/<modelo-registrado>/<versión>` una única
 vez. Las solicitudes normales no realizan llamadas a MLflow.
 
+## Smoke de model release
+
+El smoke es una verificación explícitamente opt-in para el operador después de
+una promoción manual. Ejecuta `refresh → health → predict` para
+`invoice-review`; no inicia el servicio, no cambia aliases ni contacta MLflow
+directamente.
+
+Provee exclusivamente por entorno la URL de la instancia, el token
+administrativo y la metadata esperada:
+
+```bash
+export MODEL_API_BASE_URL="https://model-api.example.internal"
+export MODEL_API_ADMIN_TOKEN="..."
+export MODEL_RELEASE_EXPECTED_MODEL_VERSION="..."
+export MODEL_RELEASE_EXPECTED_RUN_ID="..."
+uv run python scripts/model_release_smoke.py
+```
+
+Each HTTP request runs in an isolated child process with a 10-second total
+operational deadline for connection, transfer, and reading. A server that sends
+periodic bytes therefore cannot keep the smoke waiting indefinitely. On expiry,
+the parent terminates the child, waits at most one second for cleanup, and only
+if it remains alive kills it and waits at most one additional second before
+returning a safe failure. The child does not write to stdout or stderr; its
+temporary result contains only the HTTP response and is deleted before
+continuing. The command does not print the URL or token; incomplete
+configuration, HTTP errors, unexpected metadata, invalid responses, or
+out-of-range probabilities exit nonzero.
+
 ## Verificación local
 
 ```bash
@@ -107,4 +136,5 @@ El contenedor no inicia sin `MLFLOW_TRACKING_URI` y `MODEL_API_ADMIN_TOKEN`. Lue
 - Una predicción exitosa usa únicamente el modelo activo ya cargado en memoria y devuelve `model_id`, `model_version`, `run_id` y `probability`. `probability` es la probabilidad finita de la clase positiva (`1`, revisión manual); no aplica thresholds, recomendaciones ni Business Policy. La solicitud no resuelve aliases, carga artifacts ni llama a MLflow. Una salida o falla de inferencia no válida responde `503` con un detalle genérico.
 - `GET /models/{model_id}/health` responde `200` cuando el modelo está activo y devuelve `model_id`, `registered_model`, `alias`, `model_version` y `run_id` realmente servidos. Un ID registrado sin carga sigue respondiendo `503`; un ID desconocido responde `404`. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
 - `POST /admin/models/{model_id}/refresh` exige el header `X-Model-Admin-Token` que coincida con `MODEL_API_ADMIN_TOKEN`. Resuelve y carga el champion actual en un proceso aislado antes de sustituir bajo lock la instancia activa. Las solicitudes predict/health sólo obtienen una instancia completa; timeout, salida anómala del hijo, error de transferencia o falla del proveedor conservan la versión anterior y responden `503` sin detalles del proveedor. Registra eventos seguros de intento, éxito o falla sin token, credenciales ni excepción cruda del proveedor.
+- `scripts/model_release_smoke.py` es una verificación opt-in operada por entorno para `refresh → health → predict`; valida la versión/run esperados y una probabilidad finita entre 0 y 1, sin imprimir URL ni token.
 - Docker Compose, CI, despliegue cloud, el consumidor de la aplicación e INT-03 están fuera de alcance.
