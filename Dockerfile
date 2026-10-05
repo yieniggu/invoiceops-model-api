@@ -20,7 +20,9 @@ WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv .venv
 COPY --from=builder --chown=app:app /app/src ./src
 
-ENV PATH="/app/.venv/bin:$PATH"
+ENV PATH="/app/.venv/bin:$PATH" \
+    OMP_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1
 USER app
 EXPOSE 8000
 
