@@ -15,7 +15,7 @@ VALID_PREDICT_REQUEST = {
     "has_purchase_order": True,
     "three_way_match": True,
     "bank_account_recently_changed": False,
-    "country_risk": "CL",
+    "country_risk": "low",
 }
 
 
@@ -107,7 +107,10 @@ def test_unknown_model_predict_returns_not_found() -> None:
     assert response.status_code == 404
 
 
-def test_predict_returns_positive_class_probability_and_active_model_metadata() -> None:
+@pytest.mark.parametrize("country_risk", ["low", "medium", "high"])
+def test_predict_returns_positive_class_probability_and_active_model_metadata(
+    country_risk: str,
+) -> None:
     inputs: list[list[list[object]]] = []
 
     class FakeModel:
@@ -123,7 +126,8 @@ def test_predict_returns_positive_class_probability_and_active_model_metadata() 
     )
 
     response = TestClient(application).post(
-        "/models/invoice-review/predict", json=VALID_PREDICT_REQUEST
+        "/models/invoice-review/predict",
+        json={**VALID_PREDICT_REQUEST, "country_risk": country_risk},
     )
 
     assert response.status_code == 200
@@ -134,7 +138,7 @@ def test_predict_returns_positive_class_probability_and_active_model_metadata() 
         "probability": 0.8,
     }
     assert inputs == [
-        [[125000, 365, 1, 1.25, True, True, False, "CL"]]
+        [[125000, 365, 1, 1.25, True, True, False, country_risk]]
     ]
 
 
