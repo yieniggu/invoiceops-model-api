@@ -1,13 +1,116 @@
+import importlib.util
 import json
 import os
 import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from threading import Event, Thread
-from typing import ClassVar
+from typing import ClassVar, Self
 
 import pytest
+
+_smoke_spec = importlib.util.spec_from_file_location(
+    "model_release_smoke", Path(__file__).resolve().parents[1] / "scripts/model_release_smoke.py"
+)
+assert _smoke_spec is not None and _smoke_spec.loader is not None
+smoke = importlib.util.module_from_spec(_smoke_spec)
+sys.modules[_smoke_spec.name] = smoke
+_smoke_spec.loader.exec_module(smoke)
+
+
+@pytest.mark.parametrize(
+    ("override", "expected"),
+    [(None, 10), ("45", 45), ("120", 120)],
+)
+def test_smoke_http_timeout_configuration(
+    monkeypatch: pytest.MonkeyPatch, override: str | None, expected: int
+) -> None:
+    monkeypatch.setenv("MODEL_API_BASE_URL", "http://127.0.0.1:5800")
+    monkeypatch.setenv("MODEL_API_ADMIN_TOKEN", "test-token")
+    monkeypatch.setenv("MODEL_RELEASE_EXPECTED_MODEL_VERSION", "8")
+    monkeypatch.setenv("MODEL_RELEASE_EXPECTED_RUN_ID", "run-456")
+    if override is None:
+        monkeypatch.delenv("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS", override)
+
+    assert smoke.read_configuration().http_timeout_seconds == expected
+
+
+@pytest.mark.parametrize("override", ["", "0", "-1", "121", "inf", "-inf", "nan", "1e309", "abc"])
+def test_smoke_http_timeout_rejects_invalid_override(
+    monkeypatch: pytest.MonkeyPatch, override: str
+) -> None:
+    monkeypatch.setenv("MODEL_API_BASE_URL", "http://127.0.0.1:5800")
+    monkeypatch.setenv("MODEL_API_ADMIN_TOKEN", "test-token")
+    monkeypatch.setenv("MODEL_RELEASE_EXPECTED_MODEL_VERSION", "8")
+    monkeypatch.setenv("MODEL_RELEASE_EXPECTED_RUN_ID", "run-456")
+    monkeypatch.setenv("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS", override)
+
+    with pytest.raises(smoke.SmokeFailure, match="MODEL_RELEASE_HTTP_TIMEOUT_SECONDS"):
+        smoke.read_configuration()
+
+
+@pytest.mark.parametrize("timeout", [10, 45])
+def test_smoke_request_uses_timeout_for_child_and_watchdog(
+    monkeypatch: pytest.MonkeyPatch, timeout: int
+) -> None:
+    class FinishedProcess:
+        exitcode = 0
+
+        def __init__(self, *, target: object, args: tuple[object, ...], daemon: bool) -> None:
+            assert target is smoke.execute_request
+            assert daemon is True
+            assert args[-1] == timeout
+            self.path = str(args[-2])
+
+        def start(self) -> None:
+            pass
+
+        def join(self, seconds: float) -> None:
+            assert timeout - 2 < seconds <= timeout
+            with open(self.path, "w", encoding="utf-8") as result_file:
+                result_file.write('{"outcome":"response","body":"e30="}')
+
+        def is_alive(self) -> bool:
+            return False
+
+    context = type("Context", (), {"Process": FinishedProcess})()
+    monkeypatch.setattr(smoke.multiprocessing, "get_context", lambda _: context)
+    configuration = smoke.SmokeConfiguration(
+        "http://127.0.0.1:5800", "test-token", "8", "run-456", timeout
+    )
+    assert smoke.request_json(configuration, "/models/invoice-review/health", "GET") == {}
+
+
+@pytest.mark.parametrize("timeout", [10, 45])
+def test_smoke_child_urlopen_uses_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout: int
+) -> None:
+    class Response:
+        def __enter__(self) -> Self:
+            return self
+
+        def __exit__(self, *_: object) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return b"{}"
+
+    def fake_urlopen(_request: object, *, timeout: float) -> Response:
+        assert timeout == expected_timeout
+        return Response()
+
+    expected_timeout = timeout
+    monkeypatch.setattr(smoke, "urlopen", fake_urlopen)
+    result_path = str(tmp_path / "result.json")
+    smoke.execute_request("http://127.0.0.1:5800/health", None, {}, "GET", result_path, timeout)
+    assert json.loads((tmp_path / "result.json").read_text()) == {
+        "outcome": "response",
+        "body": "e30=",
+    }
 
 
 class SmokeHandler(BaseHTTPRequestHandler):

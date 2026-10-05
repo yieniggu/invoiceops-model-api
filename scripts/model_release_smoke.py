@@ -17,6 +17,7 @@ from urllib.request import Request, urlopen
 
 MODEL_ID = "invoice-review"
 HTTP_TIMEOUT_SECONDS = 10
+MAX_HTTP_TIMEOUT_SECONDS = 120
 PROCESS_CLEANUP_SECONDS = 1
 PREDICT_PAYLOAD = {
     "invoice_amount_cents": 125000,
@@ -40,6 +41,7 @@ class SmokeConfiguration:
     admin_token: str
     expected_model_version: str
     expected_run_id: str
+    http_timeout_seconds: float
 
 
 def execute_request(
@@ -48,10 +50,11 @@ def execute_request(
     headers: dict[str, str],
     method: str,
     result_path: str,
+    http_timeout_seconds: float,
 ) -> None:
     try:
         request = Request(url, data=body, headers=headers, method=method)
-        with urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+        with urlopen(request, timeout=http_timeout_seconds) as response:
             result = {"outcome": "response", "body": base64.b64encode(response.read()).decode("ascii")}
     except HTTPError as error:
         result = {"outcome": "http", "status": error.code}
@@ -88,6 +91,19 @@ def required_header_environment(name: str) -> str:
     return value
 
 
+def read_http_timeout() -> float:
+    value = os.getenv("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS")
+    if value is None:
+        return HTTP_TIMEOUT_SECONDS
+    try:
+        timeout = float(value)
+    except ValueError:
+        timeout = 0
+    if not math.isfinite(timeout) or not 0 < timeout <= MAX_HTTP_TIMEOUT_SECONDS:
+        raise SmokeFailure("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS must be finite and in (0, 120]")
+    return timeout
+
+
 def read_configuration() -> SmokeConfiguration:
     base_url = required_environment("MODEL_API_BASE_URL").rstrip("/")
     parsed_url = urlsplit(base_url)
@@ -98,6 +114,7 @@ def read_configuration() -> SmokeConfiguration:
         admin_token=required_header_environment("MODEL_API_ADMIN_TOKEN"),
         expected_model_version=required_environment("MODEL_RELEASE_EXPECTED_MODEL_VERSION"),
         expected_run_id=required_environment("MODEL_RELEASE_EXPECTED_RUN_ID"),
+        http_timeout_seconds=read_http_timeout(),
     )
 
 
@@ -123,13 +140,13 @@ def request_json(
     try:
         process = multiprocessing.get_context("spawn").Process(
             target=execute_request,
-            args=(url, body, headers, method, result_path),
+            args=(url, body, headers, method, result_path, configuration.http_timeout_seconds),
             daemon=True,
         )
         started_at = time.monotonic()
         process.start()
-        process.join(max(0, HTTP_TIMEOUT_SECONDS - (time.monotonic() - started_at)))
-        if process.is_alive() or time.monotonic() - started_at >= HTTP_TIMEOUT_SECONDS:
+        process.join(max(0, configuration.http_timeout_seconds - (time.monotonic() - started_at)))
+        if process.is_alive() or time.monotonic() - started_at >= configuration.http_timeout_seconds:
             if process.is_alive():
                 stop_request_process(process)
             raise SmokeFailure(f"{method} {path} timed out")
