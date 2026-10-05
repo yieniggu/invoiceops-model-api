@@ -614,6 +614,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "mlflow" },
+    { name = "skops" },
     { name = "uvicorn" },
 ]
 
@@ -628,6 +629,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "mlflow", specifier = "==3.16.0" },
+    { name = "skops", specifier = "==0.16.0" },
     { name = "uvicorn", specifier = ">=0.30,<1" },
 ]
 
