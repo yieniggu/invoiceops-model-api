@@ -1,7 +1,6 @@
 import logging
 import os
 import time
-from pathlib import Path
 from threading import Lock, Thread
 from types import SimpleNamespace
 
@@ -27,9 +26,6 @@ def refreshed_model_loader(*_: object) -> application.LoadedModel:
 
 
 def slow_model_loader(*_: object) -> application.LoadedModel:
-    child_pid_file = os.getenv("MODEL_REFRESH_TEST_CHILD_PID_FILE")
-    if child_pid_file:
-        Path(child_pid_file).write_text(str(os.getpid()))
     time.sleep(3)
     return loaded_model("late", "8", "run-456")
 
@@ -52,12 +48,27 @@ def abnormal_model_loader(*_: object) -> application.LoadedModel:
 
 
 def test_refresh_timeout_preserves_the_active_model_and_logs_a_safe_failure(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     configure_refresh(monkeypatch)
     monkeypatch.setenv("MODEL_REFRESH_TIMEOUT_SECONDS", "0.8")
-    child_pid_file = tmp_path / "loader.pid"
-    monkeypatch.setenv("MODEL_REFRESH_TEST_CHILD_PID_FILE", str(child_pid_file))
+    process_type = application.model_load_process_context().Process
+    actual_start = process_type.start
+    actual_close = process_type.close
+    started_pids: list[int] = []
+    closed: list[tuple[int | None, bool]] = []
+
+    def observe_start(process: object) -> None:
+        actual_start(process)
+        assert process.pid is not None
+        started_pids.append(process.pid)
+
+    def observe_close(process: object) -> None:
+        closed.append((process.exitcode, process.is_alive()))
+        actual_close(process)
+
+    monkeypatch.setattr(process_type, "start", observe_start)
+    monkeypatch.setattr(process_type, "close", observe_close)
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
@@ -82,9 +93,12 @@ def test_refresh_timeout_preserves_the_active_model_and_logs_a_safe_failure(
     ]
     assert caplog.records[1].reason == "timeout"
     assert "MODEL_API_ADMIN_TOKEN" not in caplog.text
-    assert child_pid_file.exists()
+    assert len(started_pids) == 1
+    assert len(closed) == 1
+    assert closed[0][0] is not None
+    assert closed[0][1] is False
     with pytest.raises(ProcessLookupError):
-        os.kill(int(child_pid_file.read_text()), 0)
+        os.kill(started_pids[0], 0)
 
 
 def test_refresh_requires_an_administrative_operational_credential(
