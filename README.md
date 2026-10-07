@@ -23,7 +23,7 @@ curl http://127.0.0.1:8000/health
 La respuesta esperada es:
 
 ```json
-{"status":"ok"}
+{ "status": "ok" }
 ```
 
 ## Configuración de MLflow
@@ -37,6 +37,33 @@ La autenticación básica es opcional, pero `MLFLOW_TRACKING_USERNAME` y
 `MLFLOW_TRACKING_PASSWORD` forman un par atómico: ambas deben estar definidas o
 ambas ausentes. Una configuración parcial también falla cerrado al arrancar. No
 incluyas estos valores en el repositorio, imágenes, logs o respuestas HTTP.
+
+**Compatibilidad operativa:** el pin del cliente es `mlflow==3.16.0`. Antes de
+atribuir compatibilidad con un servidor 3.16.1, prueba en un Workspace aislado
+(sin promover el alias de la instalación operada) un run sintético, su
+versión y alias, la carga real por `models:/` y el smoke HTTP
+`refresh → health → predict` con versión y run esperados. La coincidencia de
+versiones o un test con doble de cliente no sustituyen esta prueba. Si el
+servidor no alcanza el estado saludable, reporta bloqueo de entorno; no cambies
+el pin ni incrementes timeouts para presentar una compatibilidad no acreditada.
+
+La prueba host-local con un Workspace aislado en el servidor 3.16.1 completó
+la carga real con el SDK 3.16.0 y el smoke `refresh → health → predict` sobre
+un modelo sintético propio. En esta topología, el servidor anuncia descargas
+multipart mediante URLs firmadas que apuntan al nombre interno `minio:9000`,
+inaccesible para el proceso host. Se fijó
+`MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false` **sólo para los procesos de
+esta prueba**, conservando la carga nativa `models:/` a través del proxy de
+artifacts de MLflow. No se cambió el pin, el alias productivo ni la
+configuración global. El resultado no acredita la ruta multipart predeterminada
+ni un despliegue diferente; cada topología debe verificar su acceso al almacén
+o usar explícitamente el proxy de artifacts antes de afirmar compatibilidad.
+
+Si el Model API se ejecuta en el host con esta topología, configura
+`MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false` en el entorno del **proceso
+servidor Model API antes de iniciarlo**, para que lo hereden tanto la carga
+inicial como el proceso de refresh. Configurarlo únicamente en el cliente
+`scripts/model_release_smoke.py` no cambia el transporte usado por el servidor.
 
 ```bash
 export MLFLOW_TRACKING_URI="https://mlflow.example.internal"
@@ -127,8 +154,8 @@ El contenedor no inicia sin `MLFLOW_TRACKING_URI` y `MODEL_API_ADMIN_TOKEN`. Lue
 - Incluye las rutas genéricas `GET /models/{model_id}/health` y `POST /models/{model_id}/predict`; agregar un ID al catálogo no requiere agregar rutas FastAPI.
 - El catálogo local tipado mapea cada ID lógico a un modelo registrado y a un alias no vacío:
 
-| ID lógico | Modelo registrado | Alias |
-| --- | --- | --- |
+| ID lógico        | Modelo registrado           | Alias      |
+| ---------------- | --------------------------- | ---------- |
 | `invoice-review` | `invoice-review-production` | `champion` |
 
 - Un ID desconocido responde `404`. Un ID registrado que no pudo cargar responde `503`; el detalle de su respuesta de health incluye el ID lógico, el modelo registrado, el alias y un mensaje de loader no disponible. Fallas del proveedor, alias, metadata o carga degradan sólo el ID afectado y no exponen el error del proveedor.
