@@ -132,6 +132,27 @@ uv run ruff check .
 uv build
 ```
 
+## CI del repositorio (API-07, fase local)
+
+`.github/workflows/ci.yml` declara una verificación en pull requests hacia
+`main`, pushes a `main` y ejecución manual. Usa Python 3.12 y uv 0.12.5;
+comprueba el lockfile, instala dependencias y herramientas de desarrollo con
+`uv sync --locked --all-groups`, ejecuta **toda** la suite pytest y
+`ruff check .`, y construye sdist y wheel con el backend Hatchling declarado.
+Cada paso falla normalmente si su comando falla; el job tiene un límite de
+20 minutos. La instalación de herramientas y dependencias ocurre sólo cuando
+un runner ejecute el workflow, no por agregar este archivo.
+
+El workflow tiene permiso `contents: read`, no conserva credenciales de checkout,
+no configura secretos ni credenciales Cloud Run/MLflow y no publica imágenes,
+despliega servicios, entrena modelos ni modifica el alias `champion`. El formato
+global **no** es un gate de CI: CR013 identifica cuatro archivos intactos que
+no superan `ruff format --check .`. Para Python modificado, verificar formato
+sólo en los archivos del cambio hasta resolver ese seguimiento por separado;
+no presentar el check global como aprobado. Esta fase sólo declara CI: todavía
+no hay ejecución del workflow en GitHub, publicación de digest ni validación
+de configuración, salud de proceso/modelo o rollback en Cloud Run.
+
 ## Container and local Compose ownership
 
 The production image is built from this repository's `Dockerfile` and `uv.lock`.
@@ -516,4 +537,4 @@ modelo/alias y operaciones permitidas; este intento sólo usó el Docker local.
 - `GET /models/{model_id}/health` responde `200` cuando el modelo está activo y devuelve `model_id`, `registered_model`, `alias`, `model_version` y `run_id` realmente servidos. Un ID registrado sin carga sigue respondiendo `503`; un ID desconocido responde `404`. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
 - `POST /admin/models/{model_id}/refresh` exige el header `X-Model-Admin-Token` que coincida con `MODEL_API_ADMIN_TOKEN`. Resuelve y carga el champion actual en un proceso aislado antes de sustituir bajo lock la instancia activa. Las solicitudes predict/health sólo obtienen una instancia completa; timeout, salida anómala del hijo, error de transferencia o falla del proveedor conservan la versión anterior y responden `503` sin detalles del proveedor. Registra eventos seguros de intento, éxito o falla sin token, credenciales ni excepción cruda del proveedor.
 - `scripts/model_release_smoke.py` es una verificación opt-in operada por entorno para `refresh → health → predict`; valida la versión/run esperados y una probabilidad finita entre 0 y 1, sin imprimir URL ni token.
-- Local Compose is provided by the existing App and MLflow overlays linked above; CI and cloud deployment remain out of scope. The application consumer is documented in INT-01, and INT-03 was absorbed by APP-08.
+- Local Compose is provided by the existing App and MLflow overlays linked above; only repository CI is declared for API-07. Cloud deployment remains out of scope. The application consumer is documented in INT-01, and INT-03 was absorbed by APP-08.
