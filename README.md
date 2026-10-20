@@ -3,6 +3,21 @@
 Servicio HTTP mínimo para exponer modelos de InvoiceOps. Usa un catálogo local
 explícito y carga sus modelos desde MLflow durante el inicio del proceso.
 
+**Evidencia local vigente (2026-10-19):** STACK-02 **COMPLETED — VALIDATED**;
+ops08 estándar fresco **PASS, 11/11 pruebas**, salida 0 en **556.121 s**.
+Incluye startup con champion y health/predict **200/200** con versión/run
+coincidentes, release, alias ausente y restauración sobre PostgreSQL/MinIO
+habituales. Véase el [cierre y ledger CR006–CR011 de Stack](../invoiceops-stack/README.md#cierre-vigente-stack-02--prueba-estándar-ops08).
+No reclasifica API-06 (**ACCEPTED_RISK**) ni prueba Cloud Run, integración App,
+fiabilidad universal en frío o preparación productiva. No autoriza operaciones.
+
+**Alcance de esa evidencia:** ops08 corresponde a los bytes anteriores al cambio
+de aislamiento de salida CR-012 descrito abajo; no se ha repetido contra este
+launcher. CR012 queda **RESOLVED_LOCAL** tras revisión independiente y prueba
+Linux acotada; el veredicto del lote es **READY_WITH_FOLLOW_UP**. CR013 de STACK-02
+permanece **OPEN — FOLLOW_UP_REQUIRED**, sin corrección autorizada ni aceptación
+de riesgo implícita; véase el [ledger vigente](../invoiceops-stack/README.md#cierre-de-hallazgos-stack-02).
+
 ## Inicio rápido
 
 Requiere Python 3.12 y [uv](https://docs.astral.sh/uv/).
@@ -80,20 +95,138 @@ incluyas en el repositorio, imágenes, logs o respuestas HTTP.
 export MODEL_API_ADMIN_TOKEN="..."
 ```
 
-`MODEL_REFRESH_TIMEOUT_SECONDS` es opcional y define el límite del refresh
-administrativo completo; su valor por defecto es `30`. Debe ser un número finito
-positivo. El refresh carga en un proceso aislado: al vencer el límite, el proceso
-HTTP termina el hijo con una espera de limpieza acotada, conserva el modelo activo
-y responde `503`. La terminación no confirma ni informa una cancelación al proveedor.
+`MODEL_REFRESH_TIMEOUT_SECONDS` es opcional y limita la preparación del nuevo
+worker, incluidos spawn, carga, deserialización y recepción de metadata; su valor
+por defecto sigue siendo **30 s**. Debe ser finito y positivo. Si falla o vence el
+plazo, se termina y recolecta el candidato, se conserva el worker activo y se
+responde `503`. La limpieza añade como máximo **0,3 s por worker** de esperas
+programadas (terminate/join 0,1 s, kill/join 0,1 s y cierre IPC 0,1 s). No confirma
+cancelación del proveedor ni garantiza planificación puntual del sistema operativo.
 
 ```bash
 export MODEL_REFRESH_TIMEOUT_SECONDS="30"
 ```
 
-Por cada entrada del catálogo, el inicio resuelve su alias, retiene en memoria
-el objeto cargado junto con `model_version` y `run_id`, y carga la versión
-concreta resuelta mediante `models:/<modelo-registrado>/<versión>` una única
-vez. Las solicitudes normales no realizan llamadas a MLflow.
+`MODEL_STARTUP_TIMEOUT_SECONDS` es opcional, finito y positivo, con default
+**180 s por entrada**. El arranque usa el mismo supervisor, sin ejecutar el loader
+en el proceso HTTP. Los imports anteriores al lifespan quedan fuera de este plazo;
+un supervisor externo debe cubrirlos. Una carga fallida degrada sólo esa entrada.
+
+### Worker propio, inferencia y cierre
+
+El estimador y toda deserialización permanecen en un proceso propio creado con
+`spawn` durante toda la vida del modelo. El proceso HTTP retiene únicamente un
+proxy con `classes_`, `predict_proba`, versión y run. Se mantiene la llamada
+posicional de ocho features y la conversión numpy dentro del worker; no se
+transfiere ni deserializa un pickle del modelo en el API. La carga concreta sigue
+usando `models:/<modelo-registrado>/<versión>` o el proxy local existente, sin
+cambiar su lista de confianza skops. Predict no consulta MLflow.
+
+#### Privacidad de stdout/stderr del worker (CR-012)
+
+El launcher conecta los FD 1 y 2 del hijo a `DEVNULL` mediante `subprocess.Popen`
+antes de ejecutar su intérprete: cubre bootstrap, imports durante unpickle,
+carga, inferencia y salida normal del intérprete. No redirige los FD del proceso
+HTTP, ni siquiera temporalmente; sus eventos estructurados seguros siguen
+visibles. No hay pipes de captura, buffers de retención ni lectores de salida
+que puedan bloquear por volumen. Si falla la apertura del destino nulo o la
+creación del proceso, falla cerrado, sin heredar stdout/stderr como alternativa.
+
+`worker_launch.py` (80 líneas) incorpora `QuietSpawnContext`, conserva el protocolo
+interno de preparación/reducción de `multiprocessing` de **CPython 3.12 en
+Linux/macOS** y usa `Popen` para crear y
+recolectar al hijo. No cambia el start method global ni usa fork para ejecutar
+el loader en el intérprete HTTP. El payload privado viaja por pipe anónimo;
+argv sólo contiene el comando de bootstrap y números de FD. Debe revalidarse
+este adaptador antes de ampliar el soporte de Python o plataforma. Los pipes
+JSON, reservas previas, límites de capacidad, leases y deadlines se mantienen.
+El owner registra al hijo antes de escribir el bootstrap; ante fallos, los FD
+nuevos se cierran o quedan bajo seguimiento de recolección. No se abre un canal
+de secretos nuevo por argv ni entorno. En `app.py` sólo cambian el import y la
+factoría del contexto; `worker.py` y sus pruebas anteriores quedan intactos.
+CR012 no cambia dependencias, pins, HTTP público, autenticación, confianza ni
+fuentes de Stack/MLflow.
+
+Las regresiones de `tests/test_worker_output.py` capturan stdout/stderr desde un
+subproceso exterior con workers reales: imports anteriores al target, `print`,
+logging, `os.write`, streams originales, errores, `SystemExit`, salida `atexit`
+confirmada y volumen superior a la capacidad habitual de un pipe. Comprueban
+marcadores concurrentes completos del proceso HTTP, startup/refresh/predict HTTP,
+metadata y probabilidad, cierre concurrente, cancelación y fallos de recursos,
+incluida retención de un candidato cuya recolección no pudo confirmarse.
+
+Este límite cubre **stdout/stderr heredados**, no constituye un sandbox ni una
+garantía de borrado universal: un proveedor confiable puede abrir sus propios
+archivos o canales de red. No garantiza zeroization ni seguridad frente a un
+modelo malicioso. El protocolo privado está acotado a CPython 3.12 POSIX
+Linux/macOS: no garantiza Windows ni Python 3.13; revalidar antes de ampliarlo.
+
+**Cierre CR012 (2026-10-19): RESOLVED_LOCAL; revisión independiente
+READY_WITH_FOLLOW_UP**, sin `MUST_FIX` restante, pero con CR013 abierto. Evidencia
+recibida, no reejecutada en esta conciliación; cada corrida se informa por separado:
+
+| Gate | Resultado observado |
+| --- | --- |
+| HOST macOS, CPython 3.12.8, RED previo | 6 fallos causales de canarios, **6.95 s**, antes del fix. |
+| HOST, regresiones nuevas | **12 PASS, 6.01 s**; `test_worker_output.py`, 327 líneas, captura real exterior de FD. Incluye `sys.__stdout__`/`sys.__stderr__`, `atexit`, controles concurrentes, fallos de destino/exec/pipe, estabilidad FD, retención de owner y `TestClient` con metadata/probabilidad **0.8**. |
+| HOST, suite completa | **168 PASS, 55.46 s**: 156 anteriores + 12 nuevas; salida 0. |
+| HOST, estática | Ruff, formato de los **11 archivos Python** del cambio acumulado, AST y whitespace **PASS**; no implica formato global aprobado (deuda previa API-06 CR013, distinta del CR013 de STACK-02). |
+| HOST, revisión independiente | **12 PASS, 6.93 s**; señales/salidas **0/7/-15/-9**, comprobación **0.202 s**. |
+| HOST, comprobación final del responsable | **12 PASS, 7.82 s**. |
+| Build de producción Linux | `invoiceops-cr012-check:20261019`, salida **0**, **406.431 s**; imagen `sha256:ca9a461c58a48847d30919d56080d7f269c3217ae88436686c40ff8fc3930e32`. Linux **6.10.14 aarch64**, glibc **2.41**, CPython **3.12.15**, `USER app`, UID/GID **999/999**. |
+| Primera sonda Linux | Salida **1**, **14.146 s**: aserción privada esperaba `prediction_failure` en vez del contrato `inference_failure`. No acredita defecto productivo ni se oculta el fallo. |
+| Sonda Linux corregida, misma imagen | **6/6 PASS**, salida **0**, **30.623 s**: `success`, `load_error`, `load_exit`, `predict_error`, `predict_exit`, `import_error`. Sólo se corrigió el driver privado; sin rebuild ni cambios productivos. |
+
+En Linux, `worker_launch.py` coincide con HOST: SHA-256
+`7cfc5f73bb5b98b193958b51b1f8bcd986e75ee064bc8afed16f45df664f9edb`.
+Proxy real: `classes_=[0,1]`, ocho campos, `predict_proba=[[0.2,0.8]]`, versión
+`7`, run `run-123`. En los seis casos no aparecen canarios en ninguno de los dos
+streams y permanecen visibles los controles del proceso responsable; pool vacío
+y PIDs propios ausentes al cerrar. Liveness confirmada en los cinco casos que
+alcanzan el loader (`import_error`: no aplica); volumen alto y salidas
+**0/7/-15/-9** comprobados. No se atribuye `atexit` a Linux ni una suite pytest
+Linux de 12 casos: `atexit` está confirmado sólo por HOST.
+
+La sonda usó `stack02-cr012-linux-20261019`, `--rm`, red `none`, raíz de sólo
+lectura y tmpfs **128 MiB**, sin puertos, volúmenes ni binds. Ausencia posterior
+del nombre exacto confirmada; imagen preservada. Producción no incluye pytest
+(`--no-dev`); no se instalaron dependencias nuevas ni se tocaron servicios,
+reinicios o recursos ajenos. **NOT_VERIFIED:** wheel, CI remoto, nuevo full-stack
+u ops08 con este launcher, soporte universal de versiones y SLO. El ops08
+histórico de **11 PASS / 556.121 s** no prueba estos bytes.
+
+| Operación | Límite y comportamiento |
+| --- | --- |
+| IPC | Dos pipes anónimos no bloqueantes; header de 4 bytes y JSON de hasta 16 KiB, sólo escalares/listas, profundidad y tamaños acotados. Metadata, clases y resultados se validan antes de publicarse. Tramas parciales, corruptas, excesivas o tardías fallan sin `Connection.recv()` ni unpickle. |
+| Inferencia | **10 s internos**, incluida espera del mutex, escritura y lectura. Un RPC por worker evita cruzar respuestas. Un RPC vencido en curso, transporte corrupto o salida del hijo invalida y recolecta ese worker; predict y salud del modelo pasan a `503`. Recuperar mediante refresh autorizado. Un error completado del estimador devuelve `503` sin excepción cruda y permite reutilizar el worker vivo. |
+| Refresh concurrente | Sólo uno; otro intento recibe `503` inmediato en lugar de esperar sin límite. Carga fallida conserva modelo/run activos. |
+| Snapshot anterior | Predict adquiere una lease bajo el lock del registro, antes del RPC. Tras publicar el nuevo worker, la solicitud anterior conserva su proxy y metadata. Se retira al liberar la última lease o, como límite de drenaje, a los **10 s desde el swap**, más limpieza. Una solicitud que exceda ese drenaje falla de forma segura. |
+| Capacidad | Máximo **3 × entradas del catálogo** de owners vivos, contando activo, retirados y candidato. Si no hay capacidad, refresh responde `503` sin crear otro hijo. No depende de GC para retirar modelos. |
+| Shutdown | Bloquea nuevas publicaciones, cancela el candidato y espera hasta **0,5 s** su supervisor; cierra activos y retirados incluso con leases, sin esperar el mutex RPC para terminar al hijo. Presupuesto de esperas: **0,5 + 0,3 × owners s** (1,4 s con el catálogo actual y tres owners). Cancelar startup repetidamente no separa al supervisor de su limpieza. |
+
+El IPC admite strings de hasta 2048 caracteres, listas de hasta 64 elementos y
+números finitos de magnitud máxima `1e100`, además del presupuesto total previo
+a codificar. Inputs válidos para el schema HTTP pero fuera del límite de transporte
+no se envían al estimador y reciben `503` sin invalidar el worker; no se añade una nueva regla `422`.
+La API sigue siendo un servicio de una fila, no una API de batch arbitrario.
+
+La limpieza comprueba terminación antes de cerrar el handle. Si el SO no permite
+confirmar terminación/recolección, se informa `cleanup_unverified`, nunca una
+promesa de ausencia de procesos. Un owner retirado no verificado permanece en la
+lista acotada, registra `model_cleanup_failed` y se reintenta al cerrar; una
+publicación ya confirmada no se revierte por ese fallo posterior de limpieza.
+Estos procesos aíslan bloqueos, **no son un sandbox para artifacts no confiables**
+ni un límite de RSS del estimador. El pico puede incluir hasta tres estimadores
+e intérpretes; dimensionar memoria con el artifact real antes de desplegar.
+
+Las pruebas offline de `tests/test_model_worker.py` usan hijos reales y pipes,
+incluido startup/refresh/predict con `TestClient`, tramas incompletas, deserialización
+e inferencia bloqueadas, concurrencia, leases y cierre. El fixture HGB posicional
+de 64 filas compara outputs con el estimador directo y publica `OFFLINE_WORKER_COST`
+con latencia y RSS local mediante `ps`. RSS incluye páginas compartidas, puede variar
+por presión de memoria y no equivale a PSS ni a un pico de producción. Esta evidencia
+local no sustituye el smoke operacional: CR007 está ahora cerrado por ops08
+estándar fresco PASS, no por estas mediciones offline.
 
 ## Smoke de model release
 
@@ -113,16 +246,18 @@ export MODEL_RELEASE_EXPECTED_RUN_ID="..."
 uv run python scripts/model_release_smoke.py
 ```
 
-Each HTTP request runs in an isolated child process with a 10-second total
-operational deadline for connection, transfer, and reading. A server that sends
-periodic bytes therefore cannot keep the smoke waiting indefinitely. On expiry,
-the parent terminates the child, waits at most one second for cleanup, and only
-if it remains alive kills it and waits at most one additional second before
-returning a safe failure. The child does not write to stdout or stderr; its
-temporary result contains only the HTTP response and is deleted before
-continuing. The command does not print the URL or token; incomplete
-configuration, HTTP errors, unexpected metadata, invalid responses, or
-out-of-range probabilities exit nonzero.
+Cada solicitud HTTP se ejecuta en un hijo aislado con plazo operacional total
+para conexión, transferencia y lectura: **10 s por defecto**. La variable opcional
+`MODEL_RELEASE_HTTP_TIMEOUT_SECONDS` admite un valor finito positivo de hasta
+**125 s**; STACK-02 usa explícitamente **125 s** frente al refresh local de 120 s,
+sin alterar el default global. El arnés Stack añade un límite exterior de
+**400 s** para las tres solicitudes. Un servidor que envíe bytes periódicos no
+puede prolongar indefinidamente el plazo. Al vencerlo, el padre termina al hijo,
+espera como máximo un segundo y, sólo si sigue vivo, lo mata y espera otro
+segundo antes del fallo seguro. El hijo no escribe stdout/stderr; el temporal
+contiene sólo la respuesta HTTP y se elimina antes de continuar. El comando no
+imprime URL ni token. Configuración incompleta, HTTP fallido, metadata inesperada,
+respuesta inválida o probabilidad fuera de rango producen salida no cero.
 
 ## Verificación local
 

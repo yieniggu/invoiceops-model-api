@@ -2,10 +2,10 @@ import logging
 import os
 import time
 from threading import Lock, Thread
-from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from worker_fixtures import Estimator
 
 import invoiceops_model_api.app as application
 
@@ -18,11 +18,17 @@ def configure_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def loaded_model(model: object, version: str, run_id: str) -> application.LoadedModel:
+    if isinstance(model, str):
+        model = Estimator()
     return application.LoadedModel(model=model, model_version=version, run_id=run_id)
 
 
 def refreshed_model_loader(*_: object) -> application.LoadedModel:
     return loaded_model("refreshed", "8", "run-456")
+
+
+def active_model_loader(*_: object) -> application.LoadedModel:
+    return loaded_model("active", "7", "run-123")
 
 
 def slow_model_loader(*_: object) -> application.LoadedModel:
@@ -39,7 +45,7 @@ def failed_model_loader(*_: object) -> application.LoadedModel:
     raise RuntimeError("provider token=not-for-clients")
 
 
-def untransferable_model_loader(*_: object) -> application.LoadedModel:
+def invalid_estimator_loader(*_: object) -> application.LoadedModel:
     return loaded_model(Lock(), "8", "run-456")
 
 
@@ -64,7 +70,8 @@ def test_refresh_timeout_preserves_the_active_model_and_logs_a_safe_failure(
         started_pids.append(process.pid)
 
     def observe_close(process: object) -> None:
-        closed.append((process.exitcode, process.is_alive()))
+        if process.pid in started_pids:
+            closed.append((process.exitcode, process.is_alive()))
         actual_close(process)
 
     monkeypatch.setattr(process_type, "start", observe_start)
@@ -72,11 +79,14 @@ def test_refresh_timeout_preserves_the_active_model_and_logs_a_safe_failure(
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model="active", model_version="7", run_id="run-123"),
+        active_model_loader,
     )
     caplog.set_level(logging.INFO, logger="invoiceops_model_api.refresh")
 
     with TestClient(application.create_app()) as client:
+        started_pids.clear()
+        closed.clear()
+        caplog.clear()
         monkeypatch.setattr(application, "load_model_from_mlflow", slow_model_loader)
         started_at = time.monotonic()
         refresh = client.post("/admin/models/invoice-review/refresh", headers=ADMIN_HEADERS)
@@ -108,7 +118,7 @@ def test_refresh_requires_an_administrative_operational_credential(
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model=object(), model_version="7", run_id="run-123"),
+        active_model_loader,
     )
 
     with TestClient(application.create_app()) as client:
@@ -131,11 +141,12 @@ def test_refresh_loads_the_current_champion_and_health_reports_the_active_versio
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model="active", model_version="7", run_id="run-123"),
+        active_model_loader,
     )
     caplog.set_level(logging.INFO, logger="invoiceops_model_api.refresh")
 
     with TestClient(application.create_app()) as client:
+        caplog.clear()
         monkeypatch.setattr(
             application,
             "load_model_from_mlflow",
@@ -165,15 +176,15 @@ def test_failed_refresh_retains_the_previously_active_model(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     configure_refresh(monkeypatch)
-    active_model = object()
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model=active_model, model_version="7", run_id="run-123"),
+        active_model_loader,
     )
     caplog.set_level(logging.INFO, logger="invoiceops_model_api.refresh")
 
     with TestClient(application.create_app()) as client:
+        caplog.clear()
         monkeypatch.setattr(application, "load_model_from_mlflow", failed_model_loader)
         refresh = client.post("/admin/models/invoice-review/refresh", headers=ADMIN_HEADERS)
         health = client.get("/models/invoice-review/health")
@@ -199,7 +210,7 @@ def test_health_reads_the_previous_complete_model_while_refresh_loads(
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model="active", model_version="7", run_id="run-123"),
+        active_model_loader,
     )
     with TestClient(application.create_app()) as client:
         monkeypatch.setattr(application, "load_model_from_mlflow", delayed_model_loader)
@@ -220,21 +231,21 @@ def test_health_reads_the_previous_complete_model_while_refresh_loads(
     assert refresh_response[0].status_code == 200
 
 
-def test_refresh_rejects_an_untransferable_model_and_preserves_the_active_model(
+def test_refresh_rejects_invalid_estimator_and_preserves_the_active_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     configure_refresh(monkeypatch)
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model="active", model_version="7", run_id="run-123"),
+        active_model_loader,
     )
 
     with TestClient(application.create_app()) as client:
         monkeypatch.setattr(
             application,
             "load_model_from_mlflow",
-            untransferable_model_loader,
+            invalid_estimator_loader,
         )
         refresh = client.post("/admin/models/invoice-review/refresh", headers=ADMIN_HEADERS)
         health = client.get("/models/invoice-review/health")
@@ -251,7 +262,7 @@ def test_refresh_handles_an_abnormal_loader_exit_and_preserves_the_active_model(
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model="active", model_version="7", run_id="run-123"),
+        active_model_loader,
     )
 
     with TestClient(application.create_app()) as client:
@@ -271,7 +282,7 @@ def test_refresh_returns_not_found_for_an_unknown_model_after_authentication(
     monkeypatch.setattr(
         application,
         "load_model_from_mlflow",
-        lambda *_: SimpleNamespace(model=object(), model_version="7", run_id="run-123"),
+        active_model_loader,
     )
 
     with TestClient(application.create_app()) as client:

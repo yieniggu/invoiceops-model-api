@@ -11,12 +11,32 @@ import invoiceops_model_api.app as application
 LOCAL_TREE_PREDICTOR = "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor"
 
 
-def proxy_loader_fixture(monkeypatch, *, artifact_uri="mlflow-artifacts:/1/run-123/artifacts", files=None):
+@pytest.fixture(autouse=True)
+def local_loader_executor(monkeypatch):
+    """Keep provider-boundary stubs local; real spawn/lifespan is tested separately."""
+
+    def execute(entry, uri, timeout, loader, *, cancelled=None, owner_pool=None):
+        assert timeout > 0
+        try:
+            return loader(entry, uri)
+        except Exception as error:
+            raise application.ModelLoadFailure("load_failure") from error
+
+    monkeypatch.setattr(application, "load_model_in_isolated_process", execute)
+
+
+def proxy_loader_fixture(
+    monkeypatch, *, artifact_uri="mlflow-artifacts:/1/run-123/artifacts", files=None
+):
     calls = []
-    files = files if files is not None else [
-        SimpleNamespace(path="model/MLmodel", is_dir=False),
-        SimpleNamespace(path="model/model.skops", is_dir=False),
-    ]
+    files = (
+        files
+        if files is not None
+        else [
+            SimpleNamespace(path="model/MLmodel", is_dir=False),
+            SimpleNamespace(path="model/model.skops", is_dir=False),
+        ]
+    )
     model = object()
 
     class Client:
@@ -45,11 +65,15 @@ def proxy_loader_fixture(monkeypatch, *, artifact_uri="mlflow-artifacts:/1/run-1
         calls.append(("load", uri))
         return model
 
-    monkeypatch.setitem(sys.modules, "mlflow", SimpleNamespace(
-        set_tracking_uri=lambda uri: calls.append(("tracking", uri)),
-        MlflowClient=Client,
-        sklearn=SimpleNamespace(load_model=load),
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "mlflow",
+        SimpleNamespace(
+            set_tracking_uri=lambda uri: calls.append(("tracking", uri)),
+            MlflowClient=Client,
+            sklearn=SimpleNamespace(load_model=load),
+        ),
+    )
     monkeypatch.setenv("MODEL_API_ARTIFACT_DOWNLOAD_MODE", "proxy-http")
     monkeypatch.setenv("MLFLOW_TRACKING_USERNAME", "local-user")
     monkeypatch.setenv("MLFLOW_TRACKING_PASSWORD", "local-password")
@@ -125,7 +149,10 @@ def test_proxy_http_downloads_run_files_with_basic_auth_and_cleans_up(monkeypatc
         "/api/2.0/mlflow-artifacts/artifacts/1/run-123/artifacts/model/MLmodel",
         "/api/2.0/mlflow-artifacts/artifacts/1/run-123/artifacts/model/model.skops",
     ]
-    assert all(call[2]["Authorization"] == "Basic " + b64encode(b"local-user:local-password").decode() for call in requests)
+    assert all(
+        call[2]["Authorization"] == "Basic " + b64encode(b"local-user:local-password").decode()
+        for call in requests
+    )
     assert all(call[:2] == ("mlflow", 5000) for call in seen if call[0] != "GET")
 
 
@@ -164,11 +191,14 @@ def test_proxy_rejects_missing_expected_untrusted_type(monkeypatch):
     assert not any(call[0] in ("skops_load", "load") for call in calls)
 
 
-@pytest.mark.parametrize("uri", [
-    "s3://bucket/1/run-123/artifacts",
-    "mlflow-artifacts://evil.test/1/run-123/artifacts",
-    "mlflow-artifacts:/1/../artifacts",
-])
+@pytest.mark.parametrize(
+    "uri",
+    [
+        "s3://bucket/1/run-123/artifacts",
+        "mlflow-artifacts://evil.test/1/run-123/artifacts",
+        "mlflow-artifacts:/1/../artifacts",
+    ],
+)
 def test_proxy_rejects_untrusted_artifact_uri(monkeypatch, uri):
     proxy_loader_fixture(monkeypatch, artifact_uri=uri)
     with pytest.raises(ValueError):
@@ -177,24 +207,34 @@ def test_proxy_rejects_untrusted_artifact_uri(monkeypatch, uri):
         )
 
 
-@pytest.mark.parametrize("tracking_uri", [
-    "http://evil.test:5000", "http://mlflow:5000/path", "http://user@mlflow:5000",
-])
+@pytest.mark.parametrize(
+    "tracking_uri",
+    [
+        "http://evil.test:5000",
+        "http://mlflow:5000/path",
+        "http://user@mlflow:5000",
+    ],
+)
 def test_proxy_rejects_unapproved_tracking_origin(monkeypatch, tracking_uri):
     proxy_loader_fixture(monkeypatch)
     with pytest.raises(ValueError):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], tracking_uri)
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], tracking_uri
+        )
 
 
 @pytest.mark.parametrize("path", ["model/../other", "model/%2e%2e/other", "model/x\\y", "model//x"])
 def test_proxy_rejects_unsafe_listed_paths(monkeypatch, path):
     proxy_loader_fixture(monkeypatch, files=[SimpleNamespace(path=path, is_dir=False)])
     with pytest.raises(ValueError):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000")
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000"
+        )
 
 
 def test_proxy_rejects_redirect_and_cleans_up_partial_download(monkeypatch):
     proxy_loader_fixture(monkeypatch)
+
     class Response:
         status = 302
 
@@ -213,17 +253,24 @@ def test_proxy_rejects_redirect_and_cleans_up_partial_download(monkeypatch):
 
     monkeypatch.setattr(application.http.client, "HTTPConnection", Connection)
     with pytest.raises(ValueError):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000")
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000"
+        )
 
 
-@pytest.mark.parametrize("files", [
-    [],
-    [SimpleNamespace(path=f"model/{i}", is_dir=False) for i in range(65)],
-])
+@pytest.mark.parametrize(
+    "files",
+    [
+        [],
+        [SimpleNamespace(path=f"model/{i}", is_dir=False) for i in range(65)],
+    ],
+)
 def test_proxy_rejects_empty_or_excessive_artifact_listing(monkeypatch, files):
     proxy_loader_fixture(monkeypatch, files=files)
     with pytest.raises(ValueError):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000")
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000"
+        )
 
 
 def test_proxy_cleans_up_partial_download_on_failure(monkeypatch):
@@ -237,7 +284,9 @@ def test_proxy_cleans_up_partial_download_on_failure(monkeypatch):
 
     monkeypatch.setattr(application, "_proxy_download_file", fail_download)
     with pytest.raises(TimeoutError):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000")
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000"
+        )
     assert len(paths) == 1
     assert not paths[0].exists()
     assert not paths[0].parent.exists()
@@ -263,7 +312,9 @@ def test_proxy_cleans_up_when_local_model_deserialization_fails(monkeypatch):
     io.load = fail_load
     monkeypatch.setitem(sys.modules, "skops.io", io)
     with pytest.raises(ValueError, match="invalid model"):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000")
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000"
+        )
     assert len(model_dir) == 1
     assert not model_dir[0].exists()
     assert not any(call[0] == "load" for call in calls)
@@ -282,7 +333,9 @@ def test_proxy_rejects_total_budget_after_first_file(monkeypatch):
 
     monkeypatch.setattr(application, "_proxy_download_file", download)
     with pytest.raises(ValueError, match="limit"):
-        application.load_model_from_mlflow(application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000")
+        application.load_model_from_mlflow(
+            application.MODEL_CATALOG["invoice-review"], "http://mlflow:5000"
+        )
     assert remaining == [application.MAX_PROXY_TOTAL_BYTES, 0]
 
 
@@ -310,8 +363,13 @@ def test_proxy_rejects_oversized_response_before_writing(monkeypatch, tmp_path):
     destination = tmp_path / "artifact"
     with pytest.raises(ValueError, match="limit"):
         application._proxy_download_file(
-            "mlflow", 5000, "/api/2.0/mlflow-artifacts/artifacts/1/run-123/artifacts/model/MLmodel",
-            destination, "Basic test", application.monotonic() + 5, application.MAX_PROXY_TOTAL_BYTES,
+            "mlflow",
+            5000,
+            "/api/2.0/mlflow-artifacts/artifacts/1/run-123/artifacts/model/MLmodel",
+            destination,
+            "Basic test",
+            application.monotonic() + 5,
+            application.MAX_PROXY_TOTAL_BYTES,
         )
     assert not destination.exists()
 
@@ -346,8 +404,13 @@ def test_proxy_rejects_stream_exceeding_limit_and_closes_connection(monkeypatch,
     monkeypatch.setattr(application.http.client, "HTTPConnection", Connection)
     with pytest.raises(ValueError, match="limit"):
         application._proxy_download_file(
-            "mlflow", 5000, "/artifact", tmp_path / "artifact", "Basic test",
-            application.monotonic() + 5, 1,
+            "mlflow",
+            5000,
+            "/artifact",
+            tmp_path / "artifact",
+            "Basic test",
+            application.monotonic() + 5,
+            1,
         )
     assert closed == [True]
 
@@ -368,8 +431,13 @@ def test_proxy_rejects_expired_overall_deadline_without_request(monkeypatch, tmp
     monkeypatch.setattr(application.http.client, "HTTPConnection", Connection)
     with pytest.raises(TimeoutError):
         application._proxy_download_file(
-            "mlflow", 5000, "/artifact", tmp_path / "artifact", "Basic test",
-            application.monotonic() - 1, 1,
+            "mlflow",
+            5000,
+            "/artifact",
+            tmp_path / "artifact",
+            "Basic test",
+            application.monotonic() - 1,
+            1,
         )
     assert calls == []
 
@@ -443,25 +511,32 @@ def test_proxy_mode_preserves_model_routes_and_refresh_auth(monkeypatch):
             assert (name, alias) == ("invoice-review-production", "champion")
             return SimpleNamespace(version="7", run_id="run-123")
 
-    monkeypatch.setitem(sys.modules, "mlflow", SimpleNamespace(
-        set_tracking_uri=lambda uri: None,
-        MlflowClient=Client,
-        sklearn=SimpleNamespace(load_model=lambda uri: pytest.fail("SDK loader called")),
-    ))
+    monkeypatch.setitem(
+        sys.modules,
+        "mlflow",
+        SimpleNamespace(
+            set_tracking_uri=lambda uri: None,
+            MlflowClient=Client,
+            sklearn=SimpleNamespace(load_model=lambda uri: pytest.fail("SDK loader called")),
+        ),
+    )
     monkeypatch.setattr(application, "_load_model_via_local_proxy", lambda *args: Model())
 
     with TestClient(application.create_app()) as client:
         assert client.get("/models/invoice-review/health").json()["model_version"] == "7"
-        response = client.post("/models/invoice-review/predict", json={
-            "invoice_amount_cents": 125000,
-            "vendor_tenure_days": 365,
-            "previous_incidents_12m": 1,
-            "amount_vs_vendor_median": 1.25,
-            "has_purchase_order": True,
-            "three_way_match": True,
-            "bank_account_recently_changed": False,
-            "country_risk": "CL",
-        })
+        response = client.post(
+            "/models/invoice-review/predict",
+            json={
+                "invoice_amount_cents": 125000,
+                "vendor_tenure_days": 365,
+                "previous_incidents_12m": 1,
+                "amount_vs_vendor_median": 1.25,
+                "has_purchase_order": True,
+                "three_way_match": True,
+                "bank_account_recently_changed": False,
+                "country_risk": "CL",
+            },
+        )
         assert response.status_code == 200
         assert response.json()["probability"] == 0.7
         assert client.post("/admin/models/invoice-review/refresh").status_code == 401
