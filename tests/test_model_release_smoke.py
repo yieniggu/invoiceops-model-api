@@ -22,7 +22,7 @@ _smoke_spec.loader.exec_module(smoke)
 
 @pytest.mark.parametrize(
     ("override", "expected"),
-    [(None, 10), ("45", 45), ("120", 120)],
+    [(None, 10), ("45", 45), ("120", 120), ("125", 125)],
 )
 def test_smoke_http_timeout_configuration(
     monkeypatch: pytest.MonkeyPatch, override: str | None, expected: int
@@ -39,7 +39,7 @@ def test_smoke_http_timeout_configuration(
     assert smoke.read_configuration().http_timeout_seconds == expected
 
 
-@pytest.mark.parametrize("override", ["", "0", "-1", "121", "inf", "-inf", "nan", "1e309", "abc"])
+@pytest.mark.parametrize("override", ["", "0", "-1", "126", "inf", "-inf", "nan", "1e309", "abc"])
 def test_smoke_http_timeout_rejects_invalid_override(
     monkeypatch: pytest.MonkeyPatch, override: str
 ) -> None:

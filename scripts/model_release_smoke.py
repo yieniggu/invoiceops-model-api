@@ -17,7 +17,8 @@ from urllib.request import Request, urlopen
 
 MODEL_ID = "invoice-review"
 HTTP_TIMEOUT_SECONDS = 10
-MAX_HTTP_TIMEOUT_SECONDS = 120
+# Local refresh may consume 120s; leave room for its terminal HTTP response.
+MAX_HTTP_TIMEOUT_SECONDS = 125
 PROCESS_CLEANUP_SECONDS = 1
 PREDICT_PAYLOAD = {
     "invoice_amount_cents": 125000,
@@ -55,7 +56,10 @@ def execute_request(
     try:
         request = Request(url, data=body, headers=headers, method=method)
         with urlopen(request, timeout=http_timeout_seconds) as response:
-            result = {"outcome": "response", "body": base64.b64encode(response.read()).decode("ascii")}
+            result = {
+                "outcome": "response",
+                "body": base64.b64encode(response.read()).decode("ascii"),
+            }
     except HTTPError as error:
         result = {"outcome": "http", "status": error.code}
     except URLError:
@@ -100,7 +104,7 @@ def read_http_timeout() -> float:
     except ValueError:
         timeout = 0
     if not math.isfinite(timeout) or not 0 < timeout <= MAX_HTTP_TIMEOUT_SECONDS:
-        raise SmokeFailure("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS must be finite and in (0, 120]")
+        raise SmokeFailure("MODEL_RELEASE_HTTP_TIMEOUT_SECONDS must be finite and in (0, 125]")
     return timeout
 
 
@@ -119,7 +123,10 @@ def read_configuration() -> SmokeConfiguration:
 
 
 def request_json(
-    configuration: SmokeConfiguration, path: str, method: str, payload: dict[str, object] | None = None
+    configuration: SmokeConfiguration,
+    path: str,
+    method: str,
+    payload: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     headers = {"Accept": "application/json"}
     body = None
@@ -146,7 +153,10 @@ def request_json(
         started_at = time.monotonic()
         process.start()
         process.join(max(0, configuration.http_timeout_seconds - (time.monotonic() - started_at)))
-        if process.is_alive() or time.monotonic() - started_at >= configuration.http_timeout_seconds:
+        if (
+            process.is_alive()
+            or time.monotonic() - started_at >= configuration.http_timeout_seconds
+        ):
             if process.is_alive():
                 stop_request_process(process)
             raise SmokeFailure(f"{method} {path} timed out")
