@@ -1,5 +1,12 @@
 # InvoiceOps Model API
 
+> **Bootstrap transversal:** siga el
+> [runbook central de Stack](../invoiceops-stack/LOCAL_INFRASTRUCTURE_RUNBOOK.md)
+> para el orden de un entorno local limpio. Este README es propietario de la
+> imagen, configuración, health de modelo y release smoke; un health de proceso
+> o una receta aislada no sustituyen la ejecución integrada ni validan remoto
+> (`NOT_VERIFIED`).
+
 Servicio HTTP mínimo para exponer modelos de InvoiceOps. Usa un catálogo local
 explícito y carga sus modelos desde MLflow durante el inicio del proceso.
 
