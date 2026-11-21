@@ -1,682 +1,128 @@
 # InvoiceOps Model API
 
-> **Bootstrap transversal:** siga el
-> [runbook central de Stack](../invoiceops-stack/LOCAL_INFRASTRUCTURE_RUNBOOK.md)
-> para el orden de un entorno local limpio. Este README es propietario de la
-> imagen, configuración, health de modelo y release smoke; un health de proceso
-> o una receta aislada no sustituyen la ejecución integrada ni validan remoto
-> (`NOT_VERIFIED`).
+Internal, multi-model scoring service (MLOPS-04). The InvoiceOps backend calls it with a
+service credential; it is **not** exposed to students or the public internet.
 
-Servicio HTTP mínimo para exponer modelos de InvoiceOps. Usa un catálogo local
-explícito y carga sus modelos desde MLflow durante el inicio del proceso.
+- Loads models by **deployment**: `(workspace, registered model name, fixed integer version)` from MLflow, using a read-only service identity. Aliases are never resolved, so moving an alias in MLflow changes nothing until the app asks for another version.
+- Only **skops** models, with an explicit type allowlist plus structural validation of tree arrays; student models only ever run in resource-limited child processes, never in the HTTP process. Pickle/cloudpickle and unknown types are rejected.
+- Server-side **gate**: AUC on an official validation set that only exists inside this process.
+- Features are computed here with `invoiceops_ml.contract` (`invoice-features-v2`); the backend sends raw invoice fields plus the supplier's prior invoices.
 
-**Evidencia local vigente (2026-10-19):** STACK-02 **COMPLETED — VALIDATED**;
-ops08 estándar fresco **PASS, 11/11 pruebas**, salida 0 en **556.121 s**.
-Incluye startup con champion y health/predict **200/200** con versión/run
-coincidentes, release, alias ausente y restauración sobre PostgreSQL/MinIO
-habituales. Véase el [cierre y ledger CR006–CR011 de Stack](../invoiceops-stack/README.md#cierre-vigente-stack-02--prueba-estándar-ops08).
-No reclasifica API-06 (**ACCEPTED_RISK**) ni prueba Cloud Run, integración App,
-fiabilidad universal en frío o preparación productiva. No autoriza operaciones.
+## Configuration (environment)
 
-**Alcance de esa evidencia:** ops08 corresponde a los bytes anteriores al cambio
-de aislamiento de salida CR-012 descrito abajo; no se ha repetido contra este
-launcher. CR012 queda **RESOLVED_LOCAL** tras revisión independiente y prueba
-Linux acotada; el veredicto del lote es **READY_WITH_FOLLOW_UP**. CR013 de STACK-02
-permanece **OPEN — FOLLOW_UP_REQUIRED**, sin corrección autorizada ni aceptación
-de riesgo implícita; véase el [ledger vigente](../invoiceops-stack/README.md#cierre-de-hallazgos-stack-02).
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `MODEL_API_SERVICE_TOKEN` | yes, >= 32 chars | Bearer secret expected from the backend. The service refuses to start without it. |
+| `OFFICIAL_VALIDATION_SEED` | yes, >= 128 bits | Secret of the validation set: >= 32 hex chars (`openssl rand -hex 32`) or >= 22 base64 chars. The integer seed is derived by hashing (SHA-256). Weak or short values (`1`, `42`, ...) make the service refuse to start. Never logged or returned. |
+| `MLFLOW_TRACKING_URI` | yes | `http(s)` URL of the MLflow server **or gateway**. It is the ONLY host the service ever contacts for MLflow data (see Security model). |
+| `MODEL_API_MLFLOW_AUTH` | no (`gateway` if `GATEWAY_SERVICE_READ_TOKEN` is set, else `mlflow`) | `gateway`: `Authorization: Bearer <GATEWAY_SERVICE_READ_TOKEN>` + `X-InvoiceOps-Workspace: <workspace>` (MLOPS-02 gateway, read-only service identity). `mlflow`: MLflow's native credentials from the environment + `X-MLFLOW-WORKSPACE` (direct server / local tests). |
+| `GATEWAY_SERVICE_READ_TOKEN` | in `gateway` mode, >= 32 chars | Read-only service token of the gateway. |
+| `MLFLOW_TRACKING_TOKEN` or `MLFLOW_TRACKING_USERNAME`+`MLFLOW_TRACKING_PASSWORD` | in `mlflow` mode, as your server needs | Read natively by the MLflow client code. Ignored in `gateway` mode. |
+| `MODEL_CHECK_TIMEOUT_SECONDS` / `MODEL_CHECK_MEMORY_MB` / `MODEL_CHECK_CONCURRENCY` | no (60 / 1024 / 2) | Hard wall-clock timeout, address-space rlimit (`RLIMIT_AS`, enforced on Linux) and max concurrent one-shot check children. |
+| `MODEL_CHECK_WAIT_SECONDS` | no (10) | How long a deploy check waits for a free check slot; then 503 `BUSY`. Checks and loads run on their own bounded thread pool (not the one that serves `/predict`); beyond its admission bound they get 503 `BUSY` at once. A full disk/tmpfs or a failed spawn is a 503 `CHECK_UNAVAILABLE` (fail closed). |
+| `MODEL_API_AUDIT_HMAC_KEY` | no, >= 32 chars | Key of the audit digest in the logs. Default: derived from `MODEL_API_SERVICE_TOKEN` (`HMAC-SHA-256(token, "invoiceops-model-api/audit-key/v1")`), never a constant. |
+| `MODEL_INFERENCE_TIMEOUT_SECONDS` / `MODEL_WORKER_MEMORY_MB` | no (10 / 1024) | Per-request timeout and address-space rlimit of the inference worker. |
+| `GATE_MIN_AUC` / `GATE_MIN_LIFT` | no (0.70 / 0.02) | Gate thresholds. |
+| `OFFICIAL_VALIDATION_ROWS` | no (4000) | Rows generated for the validation set. |
+| `MAX_LOADED_DEPLOYMENTS` | no (30) | Hard cap; loads beyond it get 409. |
+| `MAX_MODEL_BYTES` | no (64 MiB) | Hard cap on `model.skops` bytes, enforced while streaming the download (listing sizes are never trusted). |
+| `MAX_BODY_BYTES` | no (4 MiB) | Largest request body of any route (declared or streamed): 413 `PAYLOAD_TOO_LARGE` beyond it. |
+| `MAX_TOTAL_PRIORS` | no (20000) | Prior invoices accepted in ONE predict/batch request (each item is also capped at 5000): 422 `TOO_MANY_PRIORS`. |
+| `MODEL_API_MLFLOW_MAX_RETRIES` / `MODEL_API_MLFLOW_TIMEOUT_SECONDS` / `MODEL_API_MLFLOW_BUDGET_SECONDS` | no (2 / 15 / 45) | Explicit bounds on every call to MLflow or the gateway: retries (0-2, exponential backoff 0.5 s), per-request timeout (1-30 s) and the total time all calls of one check may spend (the MLflow client defaults, 7 retries and 120 s, block a thread for minutes against a failing server). |
+| `MAX_CONCURRENT_DOWNLOADS` | no (2) | Artifact downloads running at once; others wait up to 10 s and then get 503 `BUSY`. |
 
-## Inicio rápido
+Run: `uv run uvicorn invoiceops_model_api.app:app --host 0.0.0.0 --port 8000`.
 
-Requiere Python 3.12 y [uv](https://docs.astral.sh/uv/).
+## API
 
-```bash
-uv sync --all-groups
-export MLFLOW_TRACKING_URI="https://mlflow.example.internal"
-export MODEL_API_ADMIN_TOKEN="..."
-uv run uvicorn invoiceops_model_api.app:app --host 0.0.0.0 --port 8000
-```
+All routes except `GET /health` need `Authorization: Bearer <MODEL_API_SERVICE_TOKEN>` (constant-time compare; otherwise 401). Errors are `{"detail": {"code", "message", ...}}`. Request validation errors never echo submitted values. Inputs are bounded: `amountPesos` is an integer in `[0, 10^13]`, names are 1-200 characters, a request body is at most `MAX_BODY_BYTES` and a request at most `MAX_TOTAL_PRIORS` prior invoices (422/413); an arithmetic overflow while computing features is a 422 `INVALID_INVOICE`, never a 500.
 
-En otra terminal, verifica el servicio:
-
-```bash
-curl http://127.0.0.1:8000/health
-```
-
-La respuesta esperada es:
-
-```json
-{ "status": "ok" }
-```
-
-## Configuración de MLflow
-
-`MLFLOW_TRACKING_URI` es obligatoria y no puede ser vacía o contener sólo
-espacios. Si falta o es inválida, el arranque falla cerrado: el proceso no queda
-operacional. El servicio sólo lee la configuración desde variables de entorno
-en el arranque; no acepta credenciales por HTTP ni desde archivos de configuración.
-
-La autenticación básica es opcional, pero `MLFLOW_TRACKING_USERNAME` y
-`MLFLOW_TRACKING_PASSWORD` forman un par atómico: ambas deben estar definidas o
-ambas ausentes. Una configuración parcial también falla cerrado al arrancar. No
-incluyas estos valores en el repositorio, imágenes, logs o respuestas HTTP.
-
-**Compatibilidad operativa:** el pin del cliente es `mlflow==3.16.0`. Antes de
-atribuir compatibilidad con un servidor 3.16.1, prueba en un Workspace aislado
-(sin promover el alias de la instalación operada) un run sintético, su
-versión y alias, la carga real por `models:/` y el smoke HTTP
-`refresh → health → predict` con versión y run esperados. La coincidencia de
-versiones o un test con doble de cliente no sustituyen esta prueba. Si el
-servidor no alcanza el estado saludable, reporta bloqueo de entorno; no cambies
-el pin ni incrementes timeouts para presentar una compatibilidad no acreditada.
-
-La prueba host-local con un Workspace aislado en el servidor 3.16.1 completó
-la carga real con el SDK 3.16.0 y el smoke `refresh → health → predict` sobre
-un modelo sintético propio. En esta topología, el servidor anuncia descargas
-multipart mediante URLs firmadas que apuntan al nombre interno `minio:9000`,
-inaccesible para el proceso host. Se fijó
-`MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false` **sólo para los procesos de
-esta prueba**, conservando la carga nativa `models:/` a través del proxy de
-artifacts de MLflow. No se cambió el pin, el alias productivo ni la
-configuración global. El resultado no acredita la ruta multipart predeterminada
-ni un despliegue diferente; cada topología debe verificar su acceso al almacén
-o usar explícitamente el proxy de artifacts antes de afirmar compatibilidad.
-
-Si el Model API se ejecuta en el host con esta topología, configura
-`MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false` en el entorno del **proceso
-servidor Model API antes de iniciarlo**, para que lo hereden tanto la carga
-inicial como el proceso de refresh. Configurarlo únicamente en el cliente
-`scripts/model_release_smoke.py` no cambia el transporte usado por el servidor.
-
-```bash
-export MLFLOW_TRACKING_URI="https://mlflow.example.internal"
-export MLFLOW_TRACKING_USERNAME="..."
-export MLFLOW_TRACKING_PASSWORD="..."
-```
-
-`MODEL_API_ADMIN_TOKEN` es obligatoria y protege exclusivamente el refresh
-administrativo. Debe proveerse sólo mediante el entorno de ejecución; si falta,
-es vacía o contiene sólo espacios, el proceso falla cerrado al iniciar. No la
-incluyas en el repositorio, imágenes, logs o respuestas HTTP.
-
-```bash
-export MODEL_API_ADMIN_TOKEN="..."
-```
-
-`MODEL_REFRESH_TIMEOUT_SECONDS` es opcional y limita la preparación del nuevo
-worker, incluidos spawn, carga, deserialización y recepción de metadata; su valor
-por defecto sigue siendo **30 s**. Debe ser finito y positivo. Si falla o vence el
-plazo, se termina y recolecta el candidato, se conserva el worker activo y se
-responde `503`. La limpieza añade como máximo **0,3 s por worker** de esperas
-programadas (terminate/join 0,1 s, kill/join 0,1 s y cierre IPC 0,1 s). No confirma
-cancelación del proveedor ni garantiza planificación puntual del sistema operativo.
-
-```bash
-export MODEL_REFRESH_TIMEOUT_SECONDS="30"
-```
-
-`MODEL_STARTUP_TIMEOUT_SECONDS` es opcional, finito y positivo, con default
-**180 s por entrada**. El arranque usa el mismo supervisor, sin ejecutar el loader
-en el proceso HTTP. Los imports anteriores al lifespan quedan fuera de este plazo;
-un supervisor externo debe cubrirlos. Una carga fallida degrada sólo esa entrada.
-
-### Worker propio, inferencia y cierre
-
-El estimador y toda deserialización permanecen en un proceso propio creado con
-`spawn` durante toda la vida del modelo. El proceso HTTP retiene únicamente un
-proxy con `classes_`, `predict_proba`, versión y run. Se mantiene la llamada
-posicional de ocho features y la conversión numpy dentro del worker; no se
-transfiere ni deserializa un pickle del modelo en el API. La carga concreta sigue
-usando `models:/<modelo-registrado>/<versión>` o el proxy local existente, sin
-cambiar su lista de confianza skops. Predict no consulta MLflow.
-
-#### Privacidad de stdout/stderr del worker (CR-012)
-
-El launcher conecta los FD 1 y 2 del hijo a `DEVNULL` mediante `subprocess.Popen`
-antes de ejecutar su intérprete: cubre bootstrap, imports durante unpickle,
-carga, inferencia y salida normal del intérprete. No redirige los FD del proceso
-HTTP, ni siquiera temporalmente; sus eventos estructurados seguros siguen
-visibles. No hay pipes de captura, buffers de retención ni lectores de salida
-que puedan bloquear por volumen. Si falla la apertura del destino nulo o la
-creación del proceso, falla cerrado, sin heredar stdout/stderr como alternativa.
-
-`worker_launch.py` (80 líneas) incorpora `QuietSpawnContext`, conserva el protocolo
-interno de preparación/reducción de `multiprocessing` de **CPython 3.12 en
-Linux/macOS** y usa `Popen` para crear y
-recolectar al hijo. No cambia el start method global ni usa fork para ejecutar
-el loader en el intérprete HTTP. El payload privado viaja por pipe anónimo;
-argv sólo contiene el comando de bootstrap y números de FD. Debe revalidarse
-este adaptador antes de ampliar el soporte de Python o plataforma. Los pipes
-JSON, reservas previas, límites de capacidad, leases y deadlines se mantienen.
-El owner registra al hijo antes de escribir el bootstrap; ante fallos, los FD
-nuevos se cierran o quedan bajo seguimiento de recolección. No se abre un canal
-de secretos nuevo por argv ni entorno. En `app.py` sólo cambian el import y la
-factoría del contexto; `worker.py` y sus pruebas anteriores quedan intactos.
-CR012 no cambia dependencias, pins, HTTP público, autenticación, confianza ni
-fuentes de Stack/MLflow.
-
-Las regresiones de `tests/test_worker_output.py` capturan stdout/stderr desde un
-subproceso exterior con workers reales: imports anteriores al target, `print`,
-logging, `os.write`, streams originales, errores, `SystemExit`, salida `atexit`
-confirmada y volumen superior a la capacidad habitual de un pipe. Comprueban
-marcadores concurrentes completos del proceso HTTP, startup/refresh/predict HTTP,
-metadata y probabilidad, cierre concurrente, cancelación y fallos de recursos,
-incluida retención de un candidato cuya recolección no pudo confirmarse.
-
-Este límite cubre **stdout/stderr heredados**, no constituye un sandbox ni una
-garantía de borrado universal: un proveedor confiable puede abrir sus propios
-archivos o canales de red. No garantiza zeroization ni seguridad frente a un
-modelo malicioso. El protocolo privado está acotado a CPython 3.12 POSIX
-Linux/macOS: no garantiza Windows ni Python 3.13; revalidar antes de ampliarlo.
-
-**Cierre CR012 (2026-10-19): RESOLVED_LOCAL; revisión independiente
-READY_WITH_FOLLOW_UP**, sin `MUST_FIX` restante, pero con CR013 abierto. Evidencia
-recibida, no reejecutada en esta conciliación; cada corrida se informa por separado:
-
-| Gate | Resultado observado |
+| Route | Purpose |
 | --- | --- |
-| HOST macOS, CPython 3.12.8, RED previo | 6 fallos causales de canarios, **6.95 s**, antes del fix. |
-| HOST, regresiones nuevas | **12 PASS, 6.01 s**; `test_worker_output.py`, 327 líneas, captura real exterior de FD. Incluye `sys.__stdout__`/`sys.__stderr__`, `atexit`, controles concurrentes, fallos de destino/exec/pipe, estabilidad FD, retención de owner y `TestClient` con metadata/probabilidad **0.8**. |
-| HOST, suite completa | **168 PASS, 55.46 s**: 156 anteriores + 12 nuevas; salida 0. |
-| HOST, estática | Ruff, formato de los **11 archivos Python** del cambio acumulado, AST y whitespace **PASS**; no implica formato global aprobado (deuda previa API-06 CR013, distinta del CR013 de STACK-02). |
-| HOST, revisión independiente | **12 PASS, 6.93 s**; señales/salidas **0/7/-15/-9**, comprobación **0.202 s**. |
-| HOST, comprobación final del responsable | **12 PASS, 7.82 s**. |
-| Build de producción Linux | `invoiceops-cr012-check:20261019`, salida **0**, **406.431 s**; imagen `sha256:ca9a461c58a48847d30919d56080d7f269c3217ae88436686c40ff8fc3930e32`. Linux **6.10.14 aarch64**, glibc **2.41**, CPython **3.12.15**, `USER app`, UID/GID **999/999**. |
-| Primera sonda Linux | Salida **1**, **14.146 s**: aserción privada esperaba `prediction_failure` en vez del contrato `inference_failure`. No acredita defecto productivo ni se oculta el fallo. |
-| Sonda Linux corregida, misma imagen | **6/6 PASS**, salida **0**, **30.623 s**: `success`, `load_error`, `load_exit`, `predict_error`, `predict_exit`, `import_error`. Sólo se corrigió el driver privado; sin rebuild ni cambios productivos. |
+| `GET /health` | Liveness only, no auth: `{"status":"ok"}`. |
+| `GET /metrics` | Request counters since start: `{status, processHardened, requests:{"<METHOD> <route template> <status>": count}}` (unknown HTTP methods are counted as `OTHER` and paths matching no route as `unmatched`, so the key space is bounded; in memory; the backend or a scraper may poll it with the service token). |
+| `GET /deployments` | Process health + loaded deployments: `{status, featureSchemaVersion, capacity, loaded, deployments:[{deploymentId, workspace, registeredModel, version, runId, loadedAt, metrics}], quarantined:[{deploymentId, ..., reason, quarantinedAt}]}`. |
+| `POST /deploy-check` | Body `{workspace, registeredModel, version}`. Downloads, validates, runs the gate; does **not** activate. 200 `{passed, reasons:[{code,message,detail}], metrics:{auc,dummyAuc,lift,minAuc,minLift,validationRows}\|null, featureSchemaVersion, model:{workspace,registeredModel,version,runId}}`. 502 `MLFLOW_UNAVAILABLE` (MLflow or the gateway failed within the retry/timeout/budget bounds above), 503 `GATE_UNAVAILABLE`, 503 `BUSY` (download or check slots taken), 503 `CHECK_UNAVAILABLE` (storage full or spawn failed). |
+| `PUT /deployments/{deploymentId}` | Same body. Re-runs the full check and loads only if it passes (422 `GATE_FAILED` with the same report). Idempotent for the same reference; a different reference replaces atomically. 409 `CAPACITY_EXCEEDED` past the cap. `deploymentId` matches `[A-Za-z0-9_-]{1,64}`. |
+| `DELETE /deployments/{deploymentId}` | Unload; `{deploymentId, unloaded}` (idempotent). |
+| `POST /deployments/{deploymentId}/predict` | Body `{invoice:{supplierName, amountPesos, issuedOn, dueOn, createdAt, businessStatus?}, priorInvoices:[{supplierName, amountPesos, createdAt, businessStatus}]}`. A prior carrying `decidedAt` is rejected with 422 `INVALID_REQUEST` (issue type `decided_at_not_accepted`, message «/predict acepta solo estados vigentes»): send each prior with its status as of the invoice's `createdAt`. Returns `{deploymentId, workspace, registeredModel, modelVersion, runId, featureSchemaVersion, probability}`. 404 `DEPLOYMENT_NOT_LOADED`; 503 `INFERENCE_UNAVAILABLE` (worker crashed/timed out/busy, retry; `quarantined: true` when this crash got the deployment quarantined) or `INFERENCE_FAILED`. |
+| `POST /deployments/{deploymentId}/predict-batch` | Body `{items:[<predict body>...]}` (<= 100). Returns the same metadata with `probabilities:[...]`. |
 
-En Linux, `worker_launch.py` coincide con HOST: SHA-256
-`7cfc5f73bb5b98b193958b51b1f8bcd986e75ee064bc8afed16f45df664f9edb`.
-Proxy real: `classes_=[0,1]`, ocho campos, `predict_proba=[[0.2,0.8]]`, versión
-`7`, run `run-123`. En los seis casos no aparecen canarios en ninguno de los dos
-streams y permanecen visibles los controles del proceso responsable; pool vacío
-y PIDs propios ausentes al cerrar. Liveness confirmada en los cinco casos que
-alcanzan el loader (`import_error`: no aplica); volumen alto y salidas
-**0/7/-15/-9** comprobados. No se atribuye `atexit` a Linux ni una suite pytest
-Linux de 12 casos: `atexit` está confirmado sólo por HOST.
+Reason codes (the app translates them): `INVALID_REFERENCE`, `MODEL_VERSION_NOT_FOUND`, `ARTIFACT_SOURCE_NOT_ALLOWED`, `ARTIFACT_LAYOUT_INVALID`, `ARTIFACT_TOO_LARGE`, `PICKLE_FORMAT_NOT_ALLOWED`, `UNSUPPORTED_FLAVOR`, `UNTRUSTED_TYPE` (detail.types), `SKOPS_ARCHIVE_INVALID`, `MODEL_LOAD_FAILED`, `MODEL_STRUCTURE_INVALID`, `MODEL_CHECK_CRASHED`, `MODEL_CHECK_TIMEOUT`, `SIGNATURE_MISSING`, `SIGNATURE_MISMATCH` (detail.expected/found), `NO_PREDICT_PROBA`, `INVALID_CLASSES`, `INFERENCE_FAILED`, `AUC_BELOW_MIN` (detail.auc, minAuc), `AUC_LIFT_BELOW_MIN` (detail.auc, dummyAuc, lift, minLift).
 
-La sonda usó `stack02-cr012-linux-20261019`, `--rm`, red `none`, raíz de sólo
-lectura y tmpfs **128 MiB**, sin puertos, volúmenes ni binds. Ausencia posterior
-del nombre exacto confirmada; imagen preservada. Producción no incluye pytest
-(`--no-dev`); no se instalaron dependencias nuevas ni se tocaron servicios,
-reinicios o recursos ajenos. **NOT_VERIFIED:** wheel, CI remoto, nuevo full-stack
-u ops08 con este launcher, soporte universal de versiones y SLO. El ops08
-histórico de **11 PASS / 556.121 s** no prueba estos bytes.
+## Gate
 
-| Operación | Límite y comportamiento |
-| --- | --- |
-| IPC | Dos pipes anónimos no bloqueantes; header de 4 bytes y JSON de hasta 16 KiB, sólo escalares/listas, profundidad y tamaños acotados. Metadata, clases y resultados se validan antes de publicarse. Tramas parciales, corruptas, excesivas o tardías fallan sin `Connection.recv()` ni unpickle. |
-| Inferencia | **10 s internos**, incluida espera del mutex, escritura y lectura. Un RPC por worker evita cruzar respuestas. Un RPC vencido en curso, transporte corrupto o salida del hijo invalida y recolecta ese worker; predict y salud del modelo pasan a `503`. Recuperar mediante refresh autorizado. Un error completado del estimador devuelve `503` sin excepción cruda y permite reutilizar el worker vivo. |
-| Refresh concurrente | Sólo uno; otro intento recibe `503` inmediato en lugar de esperar sin límite. Carga fallida conserva modelo/run activos. |
-| Snapshot anterior | Predict adquiere una lease bajo el lock del registro, antes del RPC. Tras publicar el nuevo worker, la solicitud anterior conserva su proxy y metadata. Se retira al liberar la última lease o, como límite de drenaje, a los **10 s desde el swap**, más limpieza. Una solicitud que exceda ese drenaje falla de forma segura. |
-| Capacidad | Máximo **3 × entradas del catálogo** de owners vivos, contando activo, retirados y candidato. Si no hay capacidad, refresh responde `503` sin crear otro hijo. No depende de GC para retirar modelos. |
-| Shutdown | Bloquea nuevas publicaciones, cancela el candidato y espera hasta **0,5 s** su supervisor; cierra activos y retirados incluso con leases, sin esperar el mutex RPC para terminar al hijo. Presupuesto de esperas: **0,5 + 0,3 × owners s** (1,4 s con el catálogo actual y tres owners). Cancelar startup repetidamente no separa al supervisor de su limpieza. |
+`generate_invoices(seed=derived from OFFICIAL_VALIDATION_SEED)` is computed in-process (the parent), cached, and never exposed or logged; only its *features* are handed to the check child, which returns scores; the parent computes AUC with the labels. Pass iff `AUC >= GATE_MIN_AUC` **and** `AUC >= dummy_auc + GATE_MIN_LIFT` (the comparison uses unrounded values); `dummy_auc` is from a `DummyClassifier(strategy="prior")` on the same set (0.5). Metrics logged by the student in MLflow are never read. Without the seed the service does not start; if a test builds the app without it, deploy-check/load answer 503 `GATE_UNAVAILABLE`.
 
-El IPC admite strings de hasta 2048 caracteres, listas de hasta 64 elementos y
-números finitos de magnitud máxima `1e100`, además del presupuesto total previo
-a codificar. Inputs válidos para el schema HTTP pero fuera del límite de transporte
-no se envían al estimador y reciben `503` sin invalidar el worker; no se añade una nueva regla `422`.
-La API sigue siendo un servicio de una fila, no una API de batch arbitrario.
+Validation-oracle mitigation: the seed has >= 128 bits (it cannot be enumerated from metrics) and the returned `auc`, `dummyAuc` and `lift` are rounded to 2 decimals. **MLOPS-05 must still rate-limit deploy-checks per group**: every check is an evaluation on the hidden set, so unlimited checks leak information regardless of rounding.
 
-La limpieza comprueba terminación antes de cerrar el handle. Si el SO no permite
-confirmar terminación/recolección, se informa `cleanup_unverified`, nunca una
-promesa de ausencia de procesos. Un owner retirado no verificado permanece en la
-lista acotada, registra `model_cleanup_failed` y se reintenta al cerrar; una
-publicación ya confirmada no se revierte por ese fallo posterior de limpieza.
-Estos procesos aíslan bloqueos, **no son un sandbox para artifacts no confiables**
-ni un límite de RSS del estimador. El pico puede incluir hasta tres estimadores
-e intérpretes; dimensionar memoria con el artifact real antes de desplegar.
+## Security model
 
-Las pruebas offline de `tests/test_model_worker.py` usan hijos reales y pipes,
-incluido startup/refresh/predict con `TestClient`, tramas incompletas, deserialización
-e inferencia bloqueadas, concurrencia, leases y cierre. El fixture HGB posicional
-de 64 filas compara outputs con el estimador directo y publica `OFFLINE_WORKER_COST`
-con latencia y RSS local mediante `ps`. RSS incluye páginas compartidas, puede variar
-por presión de memoria y no equivale a PSS ni a un pico de producción. Esta evidencia
-local no sustituye el smoke operacional: CR007 está ahora cerrado por ops08
-estándar fresco PASS, no por estas mediciones offline.
+Threat model: students fully control their registered model versions: the version `source` URI and the bytes of every artifact (including the `.npy` arrays inside the skops archive).
 
-## Smoke de model release
+**1. Only the tracking server is ever contacted (no SSRF, no credential exfiltration).** `artifacts.py` builds every URL from `MLFLOW_TRACKING_URI`; MLflow's client and `requests` never resolve a host from a version's source. The source (as resolved by the server's `get-download-uri`) is only parsed: `mlflow-artifacts:` with an EMPTY netloc (or the tracking host's own), a normalized path without `..`/`.`/empty/percent/backslash segments, no query/fragment, and, if it names `workspaces/<x>/`, `<x>` must be the deployment's workspace. `runs:/<run id>/<path>` (what the gateway allows) is resolved through the tracking server's own run record in the deployment's workspace; `models:/m-<id>` (MLflow 3 logged models, what `log_model` + register produces) arrives already resolved by `get-download-uri` to the workspace's `mlflow-artifacts:/workspaces/<ws>/...`. Everything else (`http(s)`, `s3`, `file`, foreign hosts, userinfo, unresolved `models:/name/version`, malformed URLs) is `ARTIFACT_SOURCE_NOT_ALLOWED` before any artifact request; there is no setting to re-enable other schemes/hosts. Credentials (`Authorization`) and the workspace header go only to the tracking URI; redirects are not followed. Downloads (`MLmodel` <= 1 MiB, `model.skops` <= `MAX_MODEL_BYTES`) stream with a hard byte cap enforced while reading (also on decompressed bytes), into a private temp dir.
+**2. The HTTP process never touches a student model.** skops/sklearn models are loaded and called ONLY in child processes: a one-shot **check child** (deploy check) and one supervised **inference worker** (serving). Children get a minimal environment (no service token, seed or MLflow credentials: `child_env` refuses secret-looking variables; what they need travels on the inherited socket), no stdio, their own session, an `RLIMIT_AS` memory limit (Linux/container; macOS ignores it) and no core dumps, and talk over one inherited socket with bounded JSON messages. `tests/test_inference_worker.py` asserts the HTTP modules never import the loader.
+The HTTP process itself calls `prctl(PR_SET_DUMPABLE, 0)` at start-up (Linux) and, in the container, IS PID 1 (no docker-init), so a child running as the same user cannot read its secrets from `/proc/1/environ`, `/proc/<pid>/environ` or `/proc/<pid>/mem` or ptrace it (`tests/test_hardening.py` proves the mechanism and `tests/test_container_pid1.py` the container, both in CI). Whatever a child reports back is reduced by the parent to a closed set of codes with FIXED messages and a fixed detail schema (`isolation.sanitize_failure`): a compromised child cannot turn the API response into a channel for the validation features, and the returned metrics stay rounded to 2 decimals. The only free-form detail left is the list of disallowed type names (at most 10, each a dotted identifier of at most 120 characters). Deploy checks are rate-limited by the backend (not here): it allows a bounded number of gate runs per scope per hour (10 by default, `RATE_LIMITED` with `Retry-After`) and reloads after a Model API restart do not consume that budget; this service only bounds concurrency (`MODEL_CHECK_CONCURRENCY`, `MAX_CONCURRENT_DOWNLOADS`).
+**3. Layered model validation.** (a) `skops_policy.py`: the archive's schema is read before any import, every node type must be on the allowlist, only known node loaders are accepted, `skops.io.load` gets an explicit `trusted` subset (never `True`), the zip may only contain `.npy` and `schema.json` and must expand to <= 256 MiB. (b) `structure.py`: after loading and before any predict, every `sklearn.tree._tree.Tree` (also inside forests, gradient boosting, calibrated wrappers; the object graph is walked) must have consistent `node_count`, children either `-1` (leaf, both) or strictly greater than the parent and `< node_count` (acyclic, in range), split features in `[0, n_features)`, a value array of the right shape, and `n_features` equal to the owning estimator's `n_features_in_`; HistGradientBoosting `TreePredictor.nodes` get the same child/feature/`is_leaf` checks, and categorical splits are refused. Violations are `MODEL_STRUCTURE_INVALID`. sklearn's Cython code indexes these arrays without bounds checks, so a crafted array would otherwise crash the process (SIGBUS) or loop forever. (c) Process isolation as above is the backstop if (b) ever misses something: the check child has a hard timeout and rlimit (`MODEL_CHECK_CRASHED` / `MODEL_CHECK_TIMEOUT`, API stays up) and the inference worker is supervised.
+**4. Inference worker supervision (`inference.py`).** One worker holds all active deployments (a pool would multiply the ~300 MB interpreter+sklearn cost; predictions are microseconds, so requests are serialized with a bounded wait). Every request has a timeout. If the worker crashes, hangs or runs out of memory it is killed, the request gets 503 `INFERENCE_UNAVAILABLE`, and the next request starts a fresh worker that reloads the needed deployments from the cached, already-verified artifact bytes (lazily, per deployment, so one bad model cannot block the others after a restart). A deployment that was in flight when the worker died twice (cumulative) is quarantined: unloaded, cached bytes deleted, reported under `quarantined` in `GET /deployments`; a new explicit deploy clears it.
+**5. Format rules.** `MLmodel` must have `sklearn.serialization_format == skops`, `pickled_model == model.skops` and no other flavor besides the matching `python_function`; any `.pkl/.pickle/.cloudpickle/.joblib` in the artifact directory is rejected.
+**6. No data in logs.** Feature values and invoice data are never logged (only deployment id, model name, version, reason codes). Mutating requests (`PUT`/`DELETE`) log one audit line `audit principal=<16 hex> method route status`: the principal is a keyed, truncated HMAC of the service credential (`principal_hash`), not the secret, and `anonymous` for refused requests. Counters by route and status are served by `GET /metrics`. The service logger writes INFO lines to **stdout** (configured in `create_app`, so the real container CMD emits them) as `ts=<UTC> level=INFO logger=invoiceops_model_api msg="<key=value ...>"`: `audit ...`, `deploy_check ...`, `deployment_loaded/unloaded ...`; read them with `docker logs`. If the process cannot be made non-dumpable on Linux (`prctl(PR_SET_DUMPABLE)` failed) it logs `process_hardening_failed` at ERROR and `GET /metrics` reports `"processHardened": false`.
 
-El smoke es una verificación explícitamente opt-in para el operador después de
-una promoción manual. Ejecuta `refresh → health → predict` para
-`invoice-review`; no inicia el servicio, no cambia aliases ni contacta MLflow
-directamente.
+Known limits: `RLIMIT_AS` is not enforced on macOS (development). A deploy check costs ~3-5 s (a fresh interpreter imports sklearn/skops per check); this is also why concurrent checks are capped (`MODEL_CHECK_CONCURRENCY`).
 
-Provee exclusivamente por entorno la URL de la instancia, el token
-administrativo y la metadata esperada:
+## State: the registry lives in memory only
 
-```bash
-export MODEL_API_BASE_URL="https://model-api.example.internal"
-export MODEL_API_ADMIN_TOKEN="..."
-export MODEL_RELEASE_EXPECTED_MODEL_VERSION="..."
-export MODEL_RELEASE_EXPECTED_RUN_ID="..."
-uv run python scripts/model_release_smoke.py
+The set of loaded deployments (and the quarantine list) exists only in this process. After a restart or a crash of the container `GET /deployments` is empty and `POST /deployments/{id}/predict` answers 404 `DEPLOYMENT_NOT_LOADED` until somebody sends `PUT /deployments/{id}` again; nothing is persisted on purpose (the cached model bytes live in a private temp directory that is removed). The InvoiceOps backend is the source of truth: it re-sends the `PUT` (re-running the gate) when a prediction meets `DEPLOYMENT_NOT_LOADED` or when scoring is turned on (`ensureLoaded`, single flight per deployment, up to 120 s). Its periodic reconcile does **not** re-load lost deployments eagerly: it only sweeps stale checks, records quarantines and unloads orphans. So after a restart the first prediction of each deployment pays a full gate run (a few seconds); an eager re-PUT from the backend's reconcile would remove that wait.
+
+## MLflow workspace selection (MLflow 3.16.1)
+
+The client API has no `workspace` parameter, but the server selects the workspace from a request header: `X-MLFLOW-WORKSPACE` on a direct MLflow server (`mlflow/utils/workspace_utils.py`), `X-InvoiceOps-Workspace` on the MLOPS-02 gateway (which overwrites the MLflow header itself and only lets the read-only service token read). The service sends the right header explicitly on every call (version metadata, run lookup, artifact listing/download), so it touches **no** process-global MLflow state (`WorkspaceContext`/`MLFLOW_WORKSPACE`) and needs no lock: concurrent checks never serialize on MLflow, and nothing is held during load/predict/gate. The server/gateway decides what the service identity may read in that workspace; the app must pass the right workspace per deployment. Against a server without workspaces enabled, the workspace header is rejected.
+
+## Container
+
+The image needs `invoiceops-ml` (path source `../invoiceops-ml` in `pyproject.toml`/`uv.lock`):
+
+```
+docker build --build-context ml=../invoiceops-ml -t invoiceops-model-api .
 ```
 
-Cada solicitud HTTP se ejecuta en un hijo aislado con plazo operacional total
-para conexión, transferencia y lectura: **10 s por defecto**. La variable opcional
-`MODEL_RELEASE_HTTP_TIMEOUT_SECONDS` admite un valor finito positivo de hasta
-**125 s**; STACK-02 usa explícitamente **125 s** frente al refresh local de 120 s,
-sin alterar el default global. El arnés Stack añade un límite exterior de
-**400 s** para las tres solicitudes. Un servidor que envíe bytes periódicos no
-puede prolongar indefinidamente el plazo. Al vencerlo, el padre termina al hijo,
-espera como máximo un segundo y, sólo si sigue vivo, lo mata y espera otro
-segundo antes del fallo seguro. El hijo no escribe stdout/stderr; el temporal
-contiene sólo la respuesta HTTP y se elimina antes de continuar. El comando no
-imprime URL ni token. Configuración incompleta, HTTP fallido, metadata inesperada,
-respuesta inválida o probabilidad fuera de rango producen salida no cero.
+Only `pyproject.toml`, `README.md` and `src/` of that directory are copied (to `/invoiceops-ml`, which is where `../invoiceops-ml` resolves from `/app`). In a pipeline use a clean checkout (or git URL) as the `ml` context. Secrets are runtime env only. Bind the service to the internal network only.
 
-## Verificación local
+## Memory (measured)
 
-```bash
-uv run pytest
-uv run ruff check .
-uv build
+Two measurements. The first (macOS, `scripts/measure_memory.py`, through the real API with a local MLflow) gave the shape; the one that counts is the second, taken **inside a Linux container of the production image** (python 3.12.16, sklearn 1.9.1, 4000-row models, `docker run --entrypoint python ... scripts/measure_container.py`; `RLIMIT_AS` is enforced there). Peaks come from `/proc/<pid>/status`: `VmHWM` (peak resident) and `VmPeak` (peak virtual, what `RLIMIT_AS` bounds).
+
+| State (Linux container) | RSS | peak virtual |
+| --- | --- | --- |
+| HTTP process at rest (`uvicorn`, app imported, read-only filesystem) | ~130 MB | - |
+| One-shot check child scoring the 4000-row validation set: logistic regression / HistGB (200 iter) / RandomForest (200 trees, 9.9 MiB file) | 201 / 202 / 227 MB peak, 7-8 s each | ~1.5 GB with a 3 GiB limit |
+| Inference worker, started with no model | 1 MB | 9 MB |
+| Worker holding 10 logreg + 10 HistGB + 10 RF deployments (30) | 300 MB | 544 MB |
+| ... after a 100-row predict (OpenBLAS/OpenMP threads map their stacks) | 310 MB | 1575 MB with a 3 GiB limit |
+| Smallest `RLIMIT_AS` at which a check passes (all three kinds) / the worker loads + predicts (RF) | 512 MB / <= 512 MB | |
+
+Activating a model while others are loaded briefly runs a **candidate worker** next to the serving one (blue/green, see `inference.py`), so a worker-sized (~310 MB) peak is added during an activation.
+
+Alignment of the limits with the container:
+
+* `mem_limit: 2g` (cgroup) = HTTP ~300 + serving worker ~310 + candidate worker ~310 + 2 check children x ~230 = ~1.4 GB typical, with headroom for models near the 64 MiB file cap (an unconstrained forest can need several times its file size).
+* `MODEL_CHECK_MEMORY_MB` and `MODEL_WORKER_MEMORY_MB` default to and are set in `compose.production.yml` to **1024** (`RLIMIT_AS`): twice the 512 MB at which every measured model still works and half of `mem_limit`, so one runaway child hits its own limit (`MODEL_CHECK_CRASHED` / worker restart) long before the cgroup would OOM-kill the HTTP process. The previous 3072 was larger than `mem_limit` and bounded nothing. Raise both together with `mem_limit` if you expect larger models; `MAX_LOADED_DEPLOYMENTS` and `MODEL_CHECK_CONCURRENCY` bound the sum.
+* `pids_limit: 256` (threads count): the request thread pool (40), the event loop, up to 4 child processes and their BLAS threads.
+* `read_only: true` with `/tmp` as a 768 MB **tmpfs**: the verified model cache and the downloads are the only writes (`HOME=/tmp`). Because a tmpfs lives in RAM it counts towards `mem_limit`; a full one makes a deploy fail closed. Typical models are 0.03-10 MB (30 deployments ~ 150 MB); the hard worst case (30 x 64 MiB) does not fit and is not supported without raising `mem_limit` and the tmpfs.
+* `cap_drop: [ALL]`, `no-new-privileges`. **No `init: true`**: docker-init would be PID 1 carrying the full environment (service token, validation seed, gateway token), readable through `/proc/1/environ` by any child of the same user. uvicorn is PID 1 instead: it calls `prctl(PR_SET_DUMPABLE, 0)` at start-up and runs a bounded zombie reaper thread (`procutil.start_zombie_reaper`, every 2 s, only when it is PID 1) that waits for the orphans of killed children but never for the children it tracks itself. `tests/test_container_pid1.py` runs the real image with these flags in a Linux container (CI job `Container image`) and proves that a child cannot read `/proc/1/environ` or `/proc/<ppid>/environ`; `tests/test_container_config.py` fails if `init` is enabled while secrets are in the environment.
+
+`INVOICEOPS_ML_REF` (CI repository variable): the CI guard accepts a full 40-character commit SHA or a `vX.Y.Z` tag, never a branch. **Prefer the SHA**: a tag is mutable (it can be deleted and re-created on another commit), a SHA is not. Tags stay allowed.
+
+The build fails when the version of the `ml` context differs from the one pinned in `uv.lock` (`scripts/check_ml_version.py`, run after the last `uv sync`; `uv sync --frozen` alone would accept any checkout of that path source). `.python-version` pins the interpreter (3.12) for local runs.
+
+Reproduce: `docker build --build-context ml=../invoiceops-ml -t invoiceops-model-api:measure .` and `docker run --rm --entrypoint python -v "$PWD/scripts/measure_container.py:/m/measure_container.py:ro" invoiceops-model-api:measure -u /m/measure_container.py`.
+
+## Development
+
+```
+uv sync
+uv run ruff format . && uv run ruff check .
+uv run pytest -q
 ```
 
-## CI del repositorio (API-07, fase local)
-
-`.github/workflows/ci.yml` declara una verificación en pull requests hacia
-`main`, pushes a `main` y ejecución manual. Usa Python 3.12 y uv 0.12.5;
-comprueba el lockfile, instala dependencias y herramientas de desarrollo con
-`uv sync --locked --all-groups`, ejecuta **toda** la suite pytest y
-`ruff check .`, y construye sdist y wheel con el backend Hatchling declarado.
-Cada paso falla normalmente si su comando falla; el job tiene un límite de
-20 minutos. La instalación de herramientas y dependencias ocurre sólo cuando
-un runner ejecute el workflow, no por agregar este archivo.
-
-El workflow tiene permiso `contents: read`, no conserva credenciales de checkout,
-no configura secretos ni credenciales Cloud Run/MLflow y no publica imágenes,
-despliega servicios, entrena modelos ni modifica el alias `champion`. El formato
-global **no** es un gate de CI: CR013 identifica cuatro archivos intactos que
-no superan `ruff format --check .`. Para Python modificado, verificar formato
-sólo en los archivos del cambio hasta resolver ese seguimiento por separado;
-no presentar el check global como aprobado. Esta fase sólo declara CI: todavía
-no hay ejecución del workflow en GitHub, publicación de digest ni validación
-de configuración, salud de proceso/modelo o rollback en Cloud Run.
-
-## Container and local Compose ownership
-
-The production image is built from this repository's `Dockerfile` and `uv.lock`.
-The runtime stage copies only the production virtual environment and `src`, runs
-as `app` (not root) on port 8000, and sets bounded BLAS thread counts. The
-`.dockerignore` excludes local environment files and development artifacts.
-These are source-level properties; a successful build does not establish
-running-image functionality.
-
-After authorization and verification that the local Docker context is the
-intended one, build from this repository with `docker build -t
-invoiceops-model-api .`. This may pull base images, install production packages,
-consume disk space and write to the local image store. The disposable local
-attempt below used a unique tag instead of overwriting this example tag.
-
-**Evidencia operativa parcial (2026-10-07):** con autorización para una
-instalación local nueva y aislada, se verificó el socket Docker local
-`unix:///var/run/docker.sock`. El build de Model API terminó correctamente en
-282,25 segundos; la inspección de configuración de la imagen confirmó
-`USER app` y el puerto `8000/tcp`. No se comprobó el UID efectivo, la
-importación de dependencias ni el funcionamiento de esa imagen en ejecución.
-MLflow y la base App nuevos alcanzaron estado saludable; migración, carga de
-propietario sintético y entrenamiento RF terminaron con código 0. El helper
-se detuvo al interpretar como JSON toda la salida del entrenamiento
-(`JSONDecodeError`); no se conservó esa salida y su causa exacta es desconocida.
-No se ejecutaron el Gate, los notebooks, la promoción, el inicio de Model API,
-la salud del modelo ni el smoke `refresh → health → predict`.
-
-Se retiraron los contenedores, volúmenes y redes de los proyectos propios, la
-red externa propia, la etiqueta de imagen única y los archivos temporales
-privados; el inventario final no encontró recursos nuevos. Los conteos de
-redes y volúmenes preexistentes no cambiaron, pero el de contenedores pasó de
-25 a 24: no se conservaron los identificadores iniciales y no se puede
-identificar ni atribuir la desaparición. La consulta local de eventos de
-contenedores entre 17:30 y 17:43 UTC no devolvió registros; no demuestra su
-causa. Recibo sanitario: `api06-receipt-1b479ee0d7.json` en el directorio
-privado temporal de evidencias, fuera de los repositorios. Antes de otra
-operación se requiere una decisión sobre esta diferencia y sobre la captura
-segura de identificadores/etiquetas y metadatos de parsing, sin guardar la
-salida cruda ni credenciales. Una nueva ejecución no queda autorizada por
-este registro.
-
-**Segundo intento local, también parcial (2026-10-07):** una instalación
-aislada nueva volvió a construir la imagen (81,70 segundos; ID
-`sha256:df50c128c325c97f2cee5f934818911dc1108ae7965284e0bffc661e144ae615`,
-`USER app`, `8000/tcp`). Se preservaron inventarios privados con ID, nombre,
-estado, imagen y etiquetas de propiedad antes y después. MLflow y la base App
-alcanzaron salud; migración y carga sintética terminaron correctamente. La
-función real `train_candidate` generó un reporte estructurado para el run
-`bfcad5dcd1c440b2873f045048d2c082` (44,91 segundos), sin depender del
-stdout mezclado del CLI. Su Gate se ejecutó y devolvió **FAIL** (código 1):
-RF no es elegible para la promoción local. El notebook 03 terminó con código 0;
-el notebook 04 terminó con código 1 después de 309,91 segundos. No se
-conservó el error privado y no se establece si fue timeout u otra falla. No
-se ejecutaron notebook 05, Gate HGB, promoción, inicio de Model API, inspección
-de UID efectivo ni smoke. El transporte `proxy-http` estaba configurado para
-la topología, pero **no** se verificó en el proceso Model API.
-
-Se eliminaron los contenedores y volúmenes propios; una comprobación posterior
-confirmó también la ausencia de la red externa propia y de ambas etiquetas de
-imagen exclusivas, retiradas por ID/nombre exactos tras detectar un defecto
-del helper de limpieza. Los inventarios completos inicial/final y el recibo
-sanitario `api06-proof-8c23b8ef36.json` permanecen en el directorio privado
-temporal de evidencias; `api06-8c23b8ef36-postcleanup.json` documenta la
-comprobación posterior sólo del namespace propio. Durante este intento,
-tres contenedores ajenos del proyecto `stablepro-chat` desaparecieron y se
-observaron tres reemplazos con los mismos nombres de servicio; no hay evidencia
-del actor o de su causa y no fueron intervenidos. La desaparición del
-contenedor del intento anterior **sigue sin resolverse**. El fallo del
-notebook 04 es histórico y no bloquea una prueba aislada del loader de API-06.
-
-**Corrección de alcance y prueba local acotada (2026-10-07):** los intentos
-anteriores de entrenamiento/Gate/notebooks no eran necesarios para probar el
-loader de API-06 y no deben repetirse para este objetivo. Se registró
-exclusivamente en un MLflow nuevo y descartable un modelo sintético sklearn
-compatible con el loader (`invoice-review-production@champion`, versión `1`),
-sin Gate ni promoción de release. El cliente local MLflow 3.16.0 confirmó
-`READY` para el run `0f369fbf72f04037900f8581100a188a`. Se reutilizó una
-imagen de producción **preexistente** (`sha256:c158ad4a26b2c46cb1fcd012b2ea825a830185f33bd8c772ff6f9acdb865ae31`)
-tras comparar el SHA-256 de `app.py` dentro de ella con el checkout. Ejecutó
-como UID **999** con `proxy-http` y cargó el modelo: `GET
-/models/invoice-review/health` respondió con versión `1` y el run esperado.
-El smoke real `scripts/model_release_smoke.py` **falló** en `POST
-/admin/models/invoice-review/refresh` con HTTP **503**; por ello no se
-comprobaron `health` posterior al refresh ni `predict` en este intento.
-La causa interna del 503 no quedó capturada; no se atribuye al modelo, al
-transporte ni a credenciales sin evidencia. Un segundo build nuevo agotó su
-límite de 360 s, aunque los dos builds de intentos anteriores habían aprobado.
-La imagen reutilizada prueba carga en ejecución, pero no constituye una
-reconstrucción exitosa en este intento. Recibo sanitizado:
-`/var/folders/y3/m1xh54ds39x7c15dzzngkh1r0000gn/T/opencode/api06-direct-6c7550084f-receipt.json`.
-Sus snapshots inicial/final indican ausencia de recursos propios y los mismos
-IDs de contenedores, redes y volúmenes preexistentes. La diferencia histórica
-de un contenedor del primer intento continúa sin explicación. El objetivo
-local permanece **parcial**: un modelo sintético prueba carga, NO elegibilidad
-de release, Gate, ruta remota ni smoke completo. Este párrafo conserva el
-resultado histórico; la prueba más reciente se registra a continuación.
-
-**Resultado local vigente (2026-10-07):** se reutilizó la misma imagen
-preexistente (`sha256:c158ad4a26b2c46cb1fcd012b2ea825a830185f33bd8c772ff6f9acdb865ae31`),
-con `app.py` idéntico al checkout y UID efectivo `999` (MLflow 3.16.0,
-sklearn 1.9.1, skops 0.16.0 en la imagen). En un namespace nuevo, el modelo
-sintético de MLflow cargó al arrancar y `predict` devolvió **0,5** con el run
-y la versión realmente activos. El primer `refresh` devolvió 503 a los
-34,016 s; la carga aislada reprodujo `ModelLoadFailure(timeout)` a los
-30,023 s. El proceso hijo llegó a `client.list_artifacts` en menos de 3 s y
-quedó bloqueado. El MinIO **propio** terminó dos veces por OOM (exit 137);
-MLflow respondió HTTP 500 para artifacts, con `EndpointConnectionError` y
-`NameResolutionError` de `minio`. Reiniciar MinIO no resolvió de forma estable
-el problema. No se modificaron el timeout, la autenticación, el loader ni el
-transporte de producción.
-
-Para aislar la prueba de conectividad API ↔ MLflow del fallo de memoria de
-MinIO, **sólo en el proyecto descartable**, se recreó MLflow con destino de
-artifacts de sistema de archivos efímero y se registró un nuevo artifact
-skops real: `invoice-review-production@champion`, versión `2`, run
-`5f18ebc598f243b9b879e71b9bdcc88f` (`READY`). En la **misma imagen y
-proceso** Model API, el refresh autenticado respondió `200` en 6,175 s,
-`health` y `predict` posteriores informaron esa versión/run y probabilidad
-`0,5`; `scripts/model_release_smoke.py` aprobó `refresh → health → predict`
-(exit 0). El refresh sin token respondió `401` sin cambiar el modelo activo.
-Esto acredita el loader, la inferencia y el transporte local `proxy-http`
-contra MLflow, **no** la ruta S3/MinIO del overlay normal ni Gate/release
-canónica o conectividad remota. El destino efímero fue exclusivamente un
-override de prueba fuera del repositorio; la configuración versionada no
-cambió. Se retiraron el contenedor API, cuatro contenedores Compose, dos
-volúmenes y la red externa propios; los conjuntos de ID de contenedores,
-redes y volúmenes preexistentes permanecieron iguales (60/18/177). Recibo
-sanitizado: `/var/folders/y3/m1xh54ds39x7c15dzzngkh1r0000gn/T/opencode/api06-final-b6209f3a18-receipt.json`.
-La desaparición histórica de un contenedor ajeno sigue sin explicación.
-
-Do not create a second Compose stack here. The existing local Model API service,
-build context, loopback port, model-loaded healthcheck and credentials wiring are
-owned by [`invoiceops-app/compose.invoiceops-local.yml`](../invoiceops-app/compose.invoiceops-local.yml).
-The MLflow overlay is owned by
-[`invoiceops-mlflow/compose.invoiceops-local.yml`](../invoiceops-mlflow/compose.invoiceops-local.yml).
-For an **authorized, fresh, disposable local installation**, follow the
-[`LOCAL_INVOICEOPS_RUNBOOK.md`](../invoiceops-mlflow/LOCAL_INVOICEOPS_RUNBOOK.md)
-from start to finish **for a full release demonstration**. Its prerequisite
-checks, local-only network, isolated project names, synthetic candidate Gate,
-explicit promotion and expected version/run capture apply to that release
-workflow, not to a disposable loader-only fixture.
-Never point that procedure at an existing or shared deployment. Infra owns the
-MLflow installation; App owns the Compose overlay; Model API owns its image,
-configuration, endpoints and release smoke script.
-
-### Receta mínima aislada: sólo carga del modelo
-
-Esta receta **no se ejecutó como parte de esta documentación**. No es una
-demostración de release: omite App, PostgreSQL App, propietarios académicos,
-notebooks, entrenamiento candidato, Quality Gate y promoción operativa. Requiere
-autorización para crear recursos locales nuevos y descartables; no reutilices un
-MLflow, alias, red, volumen, puerto o credencial existente. Reserva los puertos
-libres `5500` y `5800` en loopback; elige nombres exclusivos, inventaría su
-ausencia antes de crearlos y exporta `LOCAL_NETWORK`, `LOCAL_MLFLOW_CONTAINER`,
-`LOCAL_API_CONTAINER`, `VERIFIED_MLFLOW_IMAGE` y `VERIFIED_MODEL_API_IMAGE`.
-Ambas imágenes deben estar **ya construidas**; coteja la de Model API con este
-checkout antes de usarla. Esta receta no construye imágenes ni crea otro
-Compose persistente. Prepara en un entorno privado nuevo
-`MLFLOW_AUTH_ADMIN_USERNAME`, `MLFLOW_AUTH_ADMIN_PASSWORD`,
-`MLFLOW_FLASK_SERVER_SECRET_KEY` y `MODEL_API_ADMIN_TOKEN`; no uses valores
-en argv ni un `.env` anterior.
-
-1. Desde `invoiceops-model-api`, crea la red exclusiva e inicia el contenedor
-   MLflow propio en una terminal. La imagen MLflow debe ser la existente de
-   `invoiceops-mlflow/Dockerfile.mlflow`, cuyo entrypoint admite los stores
-   SQLite nuevos; metadata, auth y artifacts viven **sólo** en el sistema de
-   archivos efímero del contenedor. Comprueba el `401` anónimo y la respuesta
-   autenticada antes de registrar el fixture. Si el contenedor no queda sano,
-   detente; no sustituyas esto por el overlay habitual S3/MinIO.
-
-   ```bash
-   docker network create "$LOCAL_NETWORK"
-   docker run --rm --name "$LOCAL_MLFLOW_CONTAINER" \
-     --network "$LOCAL_NETWORK" --network-alias mlflow \
-     -p 127.0.0.1:5500:5000 \
-     --env MLFLOW_AUTH_ADMIN_USERNAME --env MLFLOW_AUTH_ADMIN_PASSWORD \
-     --env MLFLOW_FLASK_SERVER_SECRET_KEY \
-     --env MLFLOW_AUTH_CONFIG_PATH=/tmp/mlflow-loader/auth.ini \
-     --env MLFLOW_AUTH_DATABASE_URI=sqlite:////tmp/mlflow-loader/auth.db \
-     --env MLFLOW_BACKEND_STORE_URI=sqlite:////tmp/mlflow-loader/tracking.db \
-     --env MLFLOW_SERVER_ALLOWED_HOSTS=mlflow:5000,127.0.0.1:5500 \
-     "$VERIFIED_MLFLOW_IMAGE" mlflow server --app-name=basic-auth \
-     --host 0.0.0.0 --port 5000 --serve-artifacts \
-     --artifacts-destination /tmp/mlflow-loader/artifacts
-   ```
-
-2. En otra terminal, desde `invoiceops-model-api`, exporta
-   `MLFLOW_TRACKING_URI=http://127.0.0.1:5500`,
-   `MLFLOW_TRACKING_USERNAME` y `MLFLOW_TRACKING_PASSWORD` con los valores de
-   admin de **esta** instancia, y deja `MLFLOW_WORKSPACE` ausente. El cliente
-   Python 3.12 usa `mlflow==3.16.0`, scikit-learn y skops. Crea
-   **sólo** el fixture en esa instancia (el nombre canónico está permitido
-   únicamente porque la instancia es nueva y exclusiva):
-
-   ```bash
-   uv run python - <<'PY'
-   import mlflow
-   import mlflow.sklearn
-   import pandas as pd
-   from tempfile import TemporaryDirectory
-   from mlflow import MlflowClient
-   from sklearn.compose import ColumnTransformer
-   from sklearn.ensemble import HistGradientBoostingClassifier
-   from sklearn.pipeline import Pipeline
-   from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
-
-   rows = pd.DataFrame({
-       "invoice_amount_cents": [125000 + i * 1000 for i in range(32)],
-       "vendor_tenure_days": [365 + i for i in range(32)],
-       "previous_incidents_12m": [i % 2 for i in range(32)],
-       "amount_vs_vendor_median": [1.1] * 32,
-       "has_purchase_order": [True] * 32,
-       "three_way_match": [True] * 32,
-       "bank_account_recently_changed": [False] * 32,
-       "country_risk": [("low", "medium", "high")[i % 3] for i in range(32)],
-   })
-   model = Pipeline([
-       ("encode", ColumnTransformer(
-           [
-               ("numeric", "passthrough", [0, 1, 2, 3]),
-               ("flags", OneHotEncoder(handle_unknown="ignore", sparse_output=False), [4, 5, 6]),
-               ("risk", OrdinalEncoder(), [7]),
-           ]
-       )),
-       ("classifier", HistGradientBoostingClassifier(
-           min_samples_leaf=2, random_state=0
-       )),
-   ])
-   model.fit(rows, [i % 2 for i in range(32)])
-   with mlflow.start_run() as run:
-       with TemporaryDirectory() as model_dir:
-           mlflow.sklearn.save_model(model, model_dir, serialization_format="skops")
-           mlflow.log_artifacts(model_dir, artifact_path="model")
-   client = MlflowClient()
-   version_info = mlflow.register_model(
-       f"runs:/{run.info.run_id}/model", "invoice-review-production"
-   )
-   version = version_info.version
-   assert version_info.run_id == run.info.run_id
-   assert client.get_model_version("invoice-review-production", version).status == "READY"
-   client.set_registered_model_alias("invoice-review-production", "champion", version)
-   print("MODEL_RELEASE_EXPECTED_MODEL_VERSION=", version)
-   print("MODEL_RELEASE_EXPECTED_RUN_ID=", run.info.run_id)
-   PY
-   ```
-
-   Se ajusta con columnas tipadas del `DataFrame`, pero el Model API llama a
-   `predict_proba` con una lista posicional; por eso el selector de
-   `country_risk` debe ser `[7]`, **no** `['country_risk']`. El fixture sólo
-   demuestra carga y smoke, no fidelidad de las features categóricas de negocio.
-   El modelo sintético no tiene Gate aprobado. Comprueba en la instancia propia
-   que el artifact del run contiene `model/MLmodel` y `model/model.skops`; el
-   loader local restringe los tipos skops admitidos. Si falla, detente sin
-   cambiar la lista de confianza de producción ni un alias ajeno.
-
-3. Desde `invoiceops-model-api`, con la red e imagen exclusivas ya verificadas,
-   inicia **sólo** el proceso Model API; inyecta las variables desde el entorno
-   privado. Exporta `MLFLOW_TRACKING_URI=http://mlflow:5000` para **este**
-   contenedor (la URI loopback del cliente host no sirve en Docker). Sustituye
-   los marcadores de nombres por identificadores propios comprobados, no por
-   los de un entorno compartido:
-
-   ```bash
-   docker run --rm --name "$LOCAL_API_CONTAINER" --network "$LOCAL_NETWORK" \
-     -p 127.0.0.1:5800:8000 \
-     --env MLFLOW_TRACKING_URI --env MLFLOW_TRACKING_USERNAME \
-     --env MLFLOW_TRACKING_PASSWORD --env MLFLOW_WORKSPACE \
-     --env MODEL_API_ADMIN_TOKEN \
-     --env MODEL_API_ARTIFACT_DOWNLOAD_MODE=proxy-http \
-     "$VERIFIED_MODEL_API_IMAGE"
-   ```
-
-   Las credenciales Basic Auth deben pertenecer sólo al MLflow desechable;
-   `MLFLOW_WORKSPACE` debe permanecer ausente para este fixture del Workspace
-   predeterminado. `GET /health` no basta:
-   comprueba `GET http://127.0.0.1:5800/models/invoice-review/health` y exige
-   `200` con el run y versión obtenidos en el paso 2. Si devuelve `503`, no
-   ejecutes el smoke.
-
-4. En otra terminal de `invoiceops-model-api`, con el token privado y los
-   **valores observados** del paso 2 exportados en el entorno, verifica el mismo
-   proceso y puerto mediante el script existente:
-
-   ```bash
-   export MODEL_API_BASE_URL="http://127.0.0.1:5800"
-   uv run python scripts/model_release_smoke.py
-   ```
-
-   Se requieren `MODEL_API_ADMIN_TOKEN`,
-   `MODEL_RELEASE_EXPECTED_MODEL_VERSION` y `MODEL_RELEASE_EXPECTED_RUN_ID`.
-   El script realiza `refresh → health → predict` y falla si no coincide la
-   metadata o la probabilidad no es válida. Detén únicamente los dos
-   contenedores **creados para esta prueba** por sus nombres exactos
-   previamente inventariados y elimina después sólo su red exclusiva. No hay
-   volúmenes persistentes en este ejemplo; `--rm` retira los archivos efímeros
-    de los contenedores al detenerlos. No uses `docker volume prune`, `down -v`
-    sobre un proyecto compartido ni credenciales de otra instalación. La ruta S3/MinIO habitual,
-   la descarga SDK remota y la identidad de un build nuevo **no quedan probadas**
-   por esta receta ni por el smoke local anterior.
-
-The runbook's Model API step builds the image and starts the dedicated App
-project with `up --build --wait --wait-timeout 180 model-api backend frontend`.
-Its healthcheck requests `GET /models/invoice-review/health`; an unhealthy
-model must STOP the workflow before smoke. `GET /health` reports only process
-availability and does not prove that an artifact loaded. Once the local
-operator has verified the target and obtained `MODEL_VERSION` and `RUN_ID`
-from the authorized synthetic promotion, the runbook exports the loopback
-`MODEL_API_BASE_URL`, supplies `MODEL_API_ADMIN_TOKEN` from the private local
-environment, exports `MODEL_RELEASE_EXPECTED_MODEL_VERSION` and
-`MODEL_RELEASE_EXPECTED_RUN_ID`, then runs this command from the runbook's
-`invoiceops-mlflow` working directory:
-
-```bash
-( cd ../invoiceops-model-api && MODEL_RELEASE_HTTP_TIMEOUT_SECONDS=45 python3 scripts/model_release_smoke.py )
-```
-
-This opt-in script performs authenticated `refresh → model health → predict` and
-requires the exact expected version/run and a finite probability. It changes
-the active model in the selected Model API process; do not run it against a
-shared target. The local overlay opts into `proxy-http` for this isolated
-network only; see the runbook for its transport limits. A previous host-local
-SDK test using `MLFLOW_ENABLE_PROXY_MULTIPART_DOWNLOAD=false` does NOT prove
-that the overlay's `proxy-http` mode or the SDK default succeeds in a container.
-
-For a separately authorized remote tracking service, use the **same image**,
-with `MODEL_API_ARTIFACT_DOWNLOAD_MODE` omitted (SDK default). An operator must
-first approve the destination, Model API instance, model/alias and credential
-channel, and verify TLS trust, DNS/routing, MLflow permissions and artifact
-download reachability from **inside the container**. On a trusted operator
-shell, inject credentials from a private runtime environment, not command-line
-values or a build argument. For example, once those variables have been
-supplied privately and checked, this command passes only their names:
-
-```bash
-docker run --rm --name invoiceops-model-api-check -p 127.0.0.1:8000:8000 \
-  --env MLFLOW_TRACKING_URI --env MLFLOW_TRACKING_USERNAME \
-  --env MLFLOW_TRACKING_PASSWORD --env MLFLOW_WORKSPACE \
-  --env MODEL_API_ADMIN_TOKEN \
-  invoiceops-model-api
-```
-
-Basic Auth variables must both be present or both absent; the tracking URI
-and admin token are mandatory; `MLFLOW_WORKSPACE` is optional and must refer
-only to an authorized Workspace. Use an approved host port and container name
-only after checking they are free, and restrict access to loopback. The
-operator must then check `/health`, `/models/invoice-review/health` and the
-release smoke with expected version/run in the **same approved remote target**.
-Do not infer remote readiness from a healthy process or from local-only proxy
-settings; signed artifact URLs may require a different network path. The
-remote example is a procedure, NOT a recorded runtime PASS.
-
-On a failed load, stop before invoking the release smoke; inspect only
-sanitized service status and logs, correct the connectivity or authorization
-problem, then retry in the approved boundary. For rollback, stop only the
-Model API container started by this procedure (`docker stop
-invoiceops-model-api-check` if it is still running), or restore the prior
-Model API image/configuration in the dedicated project after explicit
-operational approval. Do not remove MLflow, DB/MinIO, shared networks or
-volumes; do not run `down -v`, promote another alias, or alter auth policy.
-La carga, el refresh y el predict locales aprobaron con el fixture sintético
-y artifacts efímeros; la ruta S3/MinIO normal falló por OOM local y el smoke
-remoto de API-06 sigue sin verificarse.
-AC03 remoto requiere autorización independiente del destino, identidad/canal,
-modelo/alias y operaciones permitidas; este intento sólo usó el Docker local.
-
-## Alcance actual
-
-- Incluye `GET /health`.
-- Incluye `GET /models`, que lista los IDs lógicos registrados en orden.
-- Incluye las rutas genéricas `GET /models/{model_id}/health` y `POST /models/{model_id}/predict`; agregar un ID al catálogo no requiere agregar rutas FastAPI.
-- El catálogo local tipado mapea cada ID lógico a un modelo registrado y a un alias no vacío:
-
-| ID lógico        | Modelo registrado           | Alias      |
-| ---------------- | --------------------------- | ---------- |
-| `invoice-review` | `invoice-review-production` | `champion` |
-
-- Un ID desconocido responde `404`. Un ID registrado que no pudo cargar responde `503`; el detalle de su respuesta de health incluye el ID lógico, el modelo registrado, el alias y un mensaje de loader no disponible. Fallas del proveedor, alias, metadata o carga degradan sólo el ID afectado y no exponen el error del proveedor.
-- `POST /models/{model_id}/predict` exige exactamente las ocho features del artifact entrenado: `invoice_amount_cents`, `vendor_tenure_days`, `previous_incidents_12m`, `amount_vs_vendor_median`, `has_purchase_order`, `three_way_match`, `bank_account_recently_changed` y `country_risk`. Un body inválido responde el `422` estándar de FastAPI.
-- Una predicción exitosa usa únicamente el modelo activo ya cargado en memoria y devuelve `model_id`, `model_version`, `run_id` y `probability`. `probability` es la probabilidad finita de la clase positiva (`1`, revisión manual); no aplica thresholds, recomendaciones ni Business Policy. La solicitud no resuelve aliases, carga artifacts ni llama a MLflow. Una salida o falla de inferencia no válida responde `503` con un detalle genérico.
-- El contrato HTTP App ↔ Model API `v1`, con request/response de ejemplo, tipos, compatibilidad, responsabilidades y fallback del consumidor, se documenta en [`../invoiceops-app/README.md`](../invoiceops-app/README.md#contrato-app--model-api-int-01-v1). `country_risk` se recibe como string estricto: `low`, `medium` y `high` son los valores entrenados que envía la aplicación, pero este endpoint no restringe el dominio a esos tres valores.
-- `GET /models/{model_id}/health` responde `200` cuando el modelo está activo y devuelve `model_id`, `registered_model`, `alias`, `model_version` y `run_id` realmente servidos. Un ID registrado sin carga sigue respondiendo `503`; un ID desconocido responde `404`. `GET /health` conserva su respuesta de proceso `200` con `{"status":"ok"}`.
-- `POST /admin/models/{model_id}/refresh` exige el header `X-Model-Admin-Token` que coincida con `MODEL_API_ADMIN_TOKEN`. Resuelve y carga el champion actual en un proceso aislado antes de sustituir bajo lock la instancia activa. Las solicitudes predict/health sólo obtienen una instancia completa; timeout, salida anómala del hijo, error de transferencia o falla del proveedor conservan la versión anterior y responden `503` sin detalles del proveedor. Registra eventos seguros de intento, éxito o falla sin token, credenciales ni excepción cruda del proveedor.
-- `scripts/model_release_smoke.py` es una verificación opt-in operada por entorno para `refresh → health → predict`; valida la versión/run esperados y una probabilidad finita entre 0 y 1, sin imprimir URL ni token.
-- Local Compose is provided by the existing App and MLflow overlays linked above; only repository CI is declared for API-07. Cloud deployment remains out of scope. The application consumer is documented in INT-01, and INT-03 was absorbed by APP-08.
+Tests start a real `mlflow server --enable-workspaces` on a free localhost port (sqlite backend, artifact proxy), log real skops models to it, and use local fake servers for SSRF/streaming/credential checks. Fault-injection tests use `tests/helpers/` entry points (a check child without structural validation, a worker that crashes/hangs on demand); production entry points always validate. The suite takes a few minutes because every check/worker spawns a fresh interpreter.

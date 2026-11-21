@@ -8,12 +8,27 @@ version = "0.1.0"
 description = "InvoiceOps model serving API"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
+# numpy, pandas, scikit-learn and skops are pinned EXACTLY and must stay equal to the pins of
+# invoiceops-ml (the package students train with). skops archives record sklearn/numpy types and
+# the allowlist in skops_policy.py/structure.py is verified against these exact versions; a model
+# trained with another sklearn/skops can load differently or fail validation. Bump all of them
+# together with invoiceops-ml, re-run the whole test suite and refresh uv.lock.
 dependencies = [
     "fastapi>=0.115,<1",
-    "mlflow==3.16.0",
-    "skops==0.16.0",
+    "invoiceops-ml",
+    "mlflow==3.16.1",
+    "numpy==2.5.3",
+    "pandas==3.0.5",
+    "pyyaml>=6,<7",
+    "scikit-learn==1.9.1",
+    "skops==0.14.0",
     "uvicorn>=0.30,<1",
 ]
+
+# Shared feature contract + synthetic data. Local path source for development; the container
+# build provides the same directory as the "ml" named build context (see Dockerfile/README).
+[tool.uv.sources]
+invoiceops-ml = { path = "../invoiceops-ml" }
 
 [dependency-groups]
 dev = [

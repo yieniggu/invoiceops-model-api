@@ -1,669 +1,649 @@
+"""InvoiceOps Model API: internal, multi-model scoring service.
+
+Every route except ``GET /health`` (liveness) requires ``Authorization: Bearer <service
+token>``. Models are loaded by deployment from a fixed MLflow model version. No invoice
+data or feature values are ever logged.
+
+This (HTTP) process NEVER imports, unpickles or calls a student model: deploy checks run in a
+one-shot limited child process and predictions in a supervised inference worker process.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import http.client
+import atexit
+import hashlib
+import hmac
+import json
 import logging
-import multiprocessing
-import os
-from base64 import b64encode
-from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager, contextmanager
+import sys
+import threading
+from collections import Counter
+from collections.abc import AsyncIterator, Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import date, datetime
 from hmac import compare_digest
-from math import isfinite
-from multiprocessing.context import BaseContext
 from pathlib import Path
-from tempfile import TemporaryDirectory
-from threading import Event, Lock
-from time import monotonic
-from urllib.parse import quote, urlsplit
+from typing import Annotated, Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request
-from pydantic import BaseModel, ConfigDict
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from invoiceops_ml.contract import FEATURE_SCHEMA_VERSION, FEATURES, compute_features
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic_core import PydanticCustomError
 
-from invoiceops_model_api.worker import (
-    ModelLoadFailure,
-    ModelProxy,
-    WorkerPool,
-    check_deadline,
-    serve_model,
-    stop_process,
+from invoiceops_model_api.artifacts import (
+    ArtifactError,
+    DownloadBusy,
+    DownloadGate,
+    MlflowUnavailable,
+    ModelRef,
+    fetch_model,
+    validate_ref,
 )
-from invoiceops_model_api.worker_launch import QuietSpawnContext
+from invoiceops_model_api.checks import CheckResult, GateUnavailable, Reason, run_check
+from invoiceops_model_api.inference import (
+    InferenceFailed,
+    InferenceSupervisor,
+    InferenceUnavailable,
+)
+from invoiceops_model_api.isolation import CheckBusy, CheckRunner
+from invoiceops_model_api.logs import configure_logging, log_value
+from invoiceops_model_api.procutil import make_undumpable, start_zombie_reaper
+from invoiceops_model_api.registry import (
+    CapacityExceeded,
+    DeploymentRegistry,
+    LoadedDeployment,
+    now_iso,
+)
+from invoiceops_model_api.settings import Settings
+
+logger = logging.getLogger("invoiceops_model_api")
+
+DeploymentId = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+# Largest invoice amount accepted (pesos). Far above any real invoice, far below float overflow.
+MAX_AMOUNT_PESOS = 10**13
+SupplierName = Annotated[str, StringConstraints(min_length=1, max_length=200)]
+AmountPesos = Annotated[int, Field(ge=0, le=MAX_AMOUNT_PESOS)]
+BusinessStatus = Annotated[str, StringConstraints(min_length=1, max_length=64)]
+MUTATING_METHODS = frozenset({"PUT", "DELETE"})
 
 
-@dataclass(frozen=True)
-class ModelCatalogEntry:
-    registered_model: str
-    alias: str
+class ModelReference(BaseModel):
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    workspace: str
+    registered_model: str = Field(alias="registeredModel")
+    version: str
+
+    def to_ref(self) -> ModelRef:
+        return ModelRef(self.workspace, self.registered_model, self.version)
 
 
-MODEL_CATALOG: dict[str, ModelCatalogEntry] = {
-    "invoice-review": ModelCatalogEntry(
-        registered_model="invoice-review-production",
-        alias="champion",
-    )
-}
-router = APIRouter()
-logger = logging.getLogger("invoiceops_model_api.refresh")
-DEFAULT_MODEL_REFRESH_TIMEOUT_SECONDS = 30.0
-# Startup has no active model to preserve and includes cold SDK/model imports.
-DEFAULT_MODEL_STARTUP_TIMEOUT_SECONDS = 180.0
-MAX_PROXY_ARTIFACTS = 64
-MAX_PROXY_FILE_BYTES = 32 * 1024 * 1024
-MAX_PROXY_TOTAL_BYTES = 64 * 1024 * 1024
-PROXY_REQUEST_TIMEOUT_SECONDS = 8.0
-PROXY_OVERALL_TIMEOUT_SECONDS = 25.0
-LOCAL_TRUSTED_SKOPS_TYPE = "sklearn.ensemble._hist_gradient_boosting.predictor.TreePredictor"
+class InvoiceIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    supplierName: SupplierName
+    amountPesos: AmountPesos
+    issuedOn: date
+    dueOn: date
+    createdAt: datetime
+    businessStatus: BusinessStatus | None = None
 
 
-@dataclass(frozen=True)
-class MlflowConfiguration:
-    tracking_uri: str
-    admin_token: str
-    refresh_timeout_seconds: float
-    startup_timeout_seconds: float = DEFAULT_MODEL_STARTUP_TIMEOUT_SECONDS
+DECIDED_AT_REJECTED = "/predict acepta solo estados vigentes"
+# Validation error types whose fixed message is safe to return (never a submitted value).
+SAFE_ERROR_MESSAGES = frozenset({"decided_at_not_accepted"})
 
 
-@dataclass(frozen=True)
-class LoadedModel:
-    model: object
-    model_version: str
-    run_id: str
+class PriorInvoiceIn(BaseModel):
+    model_config = ConfigDict(extra="ignore")
 
+    @model_validator(mode="before")
+    @classmethod
+    def reject_decided_at(cls, data: Any) -> Any:
+        # The caller must send each prior with its status AS OF the invoice's createdAt;
+        # silently ignoring ``decidedAt`` would score a different history than the caller meant.
+        if isinstance(data, dict) and "decidedAt" in data:
+            raise PydanticCustomError("decided_at_not_accepted", DECIDED_AT_REJECTED)
+        return data
 
-def read_mlflow_configuration() -> MlflowConfiguration:
-    tracking_uri = os.getenv("MLFLOW_TRACKING_URI")
-    username = os.getenv("MLFLOW_TRACKING_USERNAME")
-    password = os.getenv("MLFLOW_TRACKING_PASSWORD")
-    admin_token = os.getenv("MODEL_API_ADMIN_TOKEN")
-    if not tracking_uri or not tracking_uri.strip():
-        raise RuntimeError("MLFLOW_TRACKING_URI must be configured")
-    if (username is None) != (password is None):
-        raise RuntimeError("MLflow tracking credentials must be configured together")
-    if os.getenv("MODEL_API_ARTIFACT_DOWNLOAD_MODE", "sdk") not in ("sdk", "proxy-http"):
-        raise RuntimeError("MODEL_API_ARTIFACT_DOWNLOAD_MODE must be sdk or proxy-http")
-    if not admin_token or not admin_token.strip():
-        raise RuntimeError("MODEL_API_ADMIN_TOKEN must be configured")
-    timeout_value = os.getenv(
-        "MODEL_REFRESH_TIMEOUT_SECONDS", str(DEFAULT_MODEL_REFRESH_TIMEOUT_SECONDS)
-    )
-    try:
-        refresh_timeout_seconds = float(timeout_value)
-    except ValueError as error:
-        raise RuntimeError(
-            "MODEL_REFRESH_TIMEOUT_SECONDS must be a finite positive number"
-        ) from error
-    if not isfinite(refresh_timeout_seconds) or refresh_timeout_seconds <= 0:
-        raise RuntimeError("MODEL_REFRESH_TIMEOUT_SECONDS must be a finite positive number")
-    try:
-        startup_timeout_seconds = float(
-            os.getenv("MODEL_STARTUP_TIMEOUT_SECONDS", str(DEFAULT_MODEL_STARTUP_TIMEOUT_SECONDS))
-        )
-    except ValueError:
-        raise RuntimeError(
-            "MODEL_STARTUP_TIMEOUT_SECONDS must be a finite positive number"
-        ) from None
-    if not isfinite(startup_timeout_seconds) or startup_timeout_seconds <= 0:
-        raise RuntimeError("MODEL_STARTUP_TIMEOUT_SECONDS must be a finite positive number")
-    return MlflowConfiguration(
-        tracking_uri=tracking_uri,
-        admin_token=admin_token,
-        refresh_timeout_seconds=refresh_timeout_seconds,
-        startup_timeout_seconds=startup_timeout_seconds,
-    )
-
-
-def _safe_proxy_path(path: str) -> list[str]:
-    if not isinstance(path, str) or len(path) > 1024 or not path:
-        raise ValueError("Invalid artifact path")
-    parts = path.split("/")
-    if any(
-        part in ("", ".", "..")
-        or len(part) > 255
-        or any(char in part for char in ("\\", "%", "?", "#", ":"))
-        or any(ord(char) < 32 or ord(char) == 127 for char in part)
-        for part in parts
-    ):
-        raise ValueError("Invalid artifact path")
-    return parts
-
-
-def _proxy_origin(tracking_uri: str) -> tuple[str, int]:
-    parsed = urlsplit(tracking_uri)
-    try:
-        port = parsed.port
-    except ValueError as error:
-        raise ValueError("Invalid local MLflow origin") from error
-    host = parsed.hostname
-    if (
-        parsed.scheme != "http"
-        or host not in ("mlflow", "localhost", "127.0.0.1")
-        or port is None
-        or (host == "mlflow" and port != 5000)
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.path not in ("", "/")
-        or parsed.query
-        or parsed.fragment
-        or parsed.netloc != f"{host}:{port}"
-    ):
-        raise ValueError("Invalid local MLflow origin")
-    return host, port
-
-
-def _proxy_download_file(
-    host: str,
-    port: int,
-    path: str,
-    destination: Path,
-    authorization: str,
-    deadline: float,
-    remaining_bytes: int,
-) -> int:
-    connection = http.client.HTTPConnection(
-        host, port, timeout=min(PROXY_REQUEST_TIMEOUT_SECONDS, max(0.001, deadline - monotonic()))
-    )
-    started = monotonic()
-    try:
-        if started >= deadline:
-            raise TimeoutError("Artifact download deadline exceeded")
-        connection.request("GET", path, headers={"Authorization": authorization})
-        response = connection.getresponse()
-        if response.status != 200:  # Includes all redirects; http.client never follows them.
-            raise ValueError("Artifact proxy returned a non-success response")
-        length = response.getheader("Content-Length")
-        if length is not None and (
-            not length.isdecimal() or int(length) > min(MAX_PROXY_FILE_BYTES, remaining_bytes)
-        ):
-            raise ValueError("Artifact exceeds download limit")
-        count = 0
-        with destination.open("xb") as output:
-            while True:
-                remaining_time = min(
-                    PROXY_REQUEST_TIMEOUT_SECONDS - (monotonic() - started),
-                    deadline - monotonic(),
-                )
-                if remaining_time <= 0:
-                    raise TimeoutError("Artifact download deadline exceeded")
-                if connection.sock is not None:
-                    connection.sock.settimeout(remaining_time)
-                chunk = response.read(
-                    min(65536, min(MAX_PROXY_FILE_BYTES, remaining_bytes) - count + 1)
-                )
-                if not chunk:
-                    break
-                count += len(chunk)
-                if count > min(MAX_PROXY_FILE_BYTES, remaining_bytes):
-                    raise ValueError("Artifact exceeds download limit")
-                output.write(chunk)
-        if length is not None and count != int(length):
-            raise ValueError("Incomplete artifact download")
-        return count
-    finally:
-        connection.close()
-
-
-def _load_model_via_local_proxy(
-    mlflow: object, client: object, run_id: str, tracking_uri: str
-) -> object:
-    host, port = _proxy_origin(tracking_uri)
-    username = os.getenv("MLFLOW_TRACKING_USERNAME")
-    password = os.getenv("MLFLOW_TRACKING_PASSWORD")
-    if not username or not password:
-        raise ValueError("Local proxy credentials are required")
-    artifact_uri = client.get_run(run_id).info.artifact_uri
-    parsed = urlsplit(artifact_uri)
-    if (
-        parsed.scheme != "mlflow-artifacts"
-        or parsed.netloc
-        or parsed.query
-        or parsed.fragment
-        or not parsed.path.startswith("/")
-    ):
-        raise ValueError("Run does not use the local artifact proxy")
-    artifact_parts = _safe_proxy_path(parsed.path[1:])
-    if len(artifact_parts) < 3 or artifact_parts[-1] != "artifacts" or artifact_parts[-2] != run_id:
-        raise ValueError("Run artifact URI does not match the resolved run")
-
-    pending = ["model"]
-    files: list[str] = []
-    seen: set[str] = set()
-    while pending:
-        directory = pending.pop()
-        if directory in seen or len(seen) + len(files) >= MAX_PROXY_ARTIFACTS:
-            raise ValueError("Artifact listing exceeds limit")
-        seen.add(directory)
-        for entry in client.list_artifacts(run_id, directory):
-            parts = _safe_proxy_path(entry.path)
-            if parts[0] != "model" or "/".join(parts[:-1]) != directory:
-                raise ValueError("Artifact listing escapes the model directory")
-            if entry.path in seen or entry.path in pending or entry.path in files:
-                raise ValueError("Duplicate artifact path")
-            if len(seen) + len(pending) + len(files) >= MAX_PROXY_ARTIFACTS:
-                raise ValueError("Artifact listing exceeds limit")
-            if entry.is_dir:
-                pending.append(entry.path)
-            else:
-                files.append(entry.path)
-    if "model/MLmodel" not in files or "model/model.skops" not in files:
-        raise ValueError("Model artifact is incomplete")
-    authorization = "Basic " + b64encode(f"{username}:{password}".encode()).decode()
-    deadline = monotonic() + PROXY_OVERALL_TIMEOUT_SECONDS
-    total = 0
-    with TemporaryDirectory(prefix="invoiceops-model-") as temporary:
-        root = Path(temporary)
-        for file in sorted(files):
-            relative = _safe_proxy_path(file)
-            destination = root.joinpath(*relative)
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            proxy_path = "/api/2.0/mlflow-artifacts/artifacts/" + "/".join(
-                quote(part, safe="") for part in [*artifact_parts, *relative]
-            )
-            total += _proxy_download_file(
-                host,
-                port,
-                proxy_path,
-                destination,
-                authorization,
-                deadline,
-                MAX_PROXY_TOTAL_BYTES - total,
-            )
-        import skops.io as sio
-
-        model_file = root / "model" / "model.skops"
-        untrusted = sio.get_untrusted_types(file=model_file)
-        if untrusted != [LOCAL_TRUSTED_SKOPS_TYPE]:
-            raise ValueError("Local model artifact is not trusted")
-        return sio.load(model_file, trusted=[LOCAL_TRUSTED_SKOPS_TYPE])
-
-
-def load_model_from_mlflow(catalog_entry: ModelCatalogEntry, tracking_uri: str) -> LoadedModel:
-    import mlflow
-
-    mlflow.set_tracking_uri(tracking_uri)
-    client = mlflow.MlflowClient(tracking_uri=tracking_uri)
-    model_version = client.get_model_version_by_alias(
-        catalog_entry.registered_model, catalog_entry.alias
-    )
-    version = getattr(model_version, "version", None)
-    run_id = getattr(model_version, "run_id", None)
-    if not version or not run_id:
-        raise ValueError("MLflow model version metadata is incomplete")
-    if os.getenv("MODEL_API_ARTIFACT_DOWNLOAD_MODE", "sdk") == "proxy-http":
-        model = _load_model_via_local_proxy(mlflow, client, str(run_id), tracking_uri)
-    else:
-        model = mlflow.sklearn.load_model(f"models:/{catalog_entry.registered_model}/{version}")
-    return LoadedModel(model=model, model_version=str(version), run_id=str(run_id))
-
-
-def model_load_process_context() -> BaseContext:
-    # spawn avoids inheriting the HTTP server's threads and locks into the loader process.
-    return QuietSpawnContext()
-
-
-def _stop_loader_process(process: multiprocessing.Process) -> None:
-    stop_process(process)
-
-
-def load_model_in_isolated_process(
-    catalog_entry: ModelCatalogEntry,
-    tracking_uri: str,
-    timeout_seconds: float,
-    loader: Callable[[ModelCatalogEntry, str], LoadedModel],
-    *,
-    cancelled: Event | None = None,
-    owner_pool: WorkerPool | None = None,
-) -> LoadedModel:
-    deadline = monotonic() + timeout_seconds
-    # Applications pass their persistent pool. Standalone callers retain a
-    # successful proxy, or can recover an unverified owner through the exception.
-    owners = owner_pool if owner_pool is not None else WorkerPool(1)
-    proxy = owners.reserve(_stop_loader_process)
-    try:
-        check_deadline(deadline, cancelled)
-        proxy.launch(
-            model_load_process_context(),
-            serve_model,
-            (catalog_entry, tracking_uri, loader, deadline),
-        )
-        result = proxy.bootstrap(deadline, cancelled)
-        if result == ["failure"]:
-            raise ModelLoadFailure("load_failure")
-        if (
-            not isinstance(result, list)
-            or len(result) != 4
-            or result[0] != "ready"
-            or any(type(value) is not str or not value for value in result[1:3])
-            or not isinstance(result[3], list)
-            or not result[3]
-            or 1 not in result[3]
-            or any(type(value) not in (str, int, float, bool) for value in result[3])
-        ):
-            raise ModelLoadFailure("protocol_failure")
-        proxy.classes_ = result[3]
-        check_deadline(deadline, cancelled)
-        return LoadedModel(proxy, result[1], result[2])
-    except BaseException as error:
-        try:
-            proxy.close()
-        except ModelLoadFailure as cleanup_error:
-            cleanup_error.owner_pool = owners
-            raise cleanup_error from None
-        if isinstance(error, Exception) and not isinstance(error, ModelLoadFailure):
-            raise ModelLoadFailure("child_exit") from None
-        raise
-
-
-async def load_startup_model(
-    catalog_entry: ModelCatalogEntry,
-    configuration: MlflowConfiguration,
-    owner_pool: WorkerPool,
-) -> LoadedModel:
-    # The thread only owns the bounded process supervisor, never the model loader.
-    # Keep the event loop cancellable and wait for owned-child cleanup on cancellation.
-    cancelled = Event()
-    task = asyncio.create_task(
-        asyncio.to_thread(
-            load_model_in_isolated_process,
-            catalog_entry,
-            configuration.tracking_uri,
-            configuration.startup_timeout_seconds,
-            load_model_from_mlflow,
-            cancelled=cancelled,
-            owner_pool=owner_pool,
-        )
-    )
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        cancelled.set()
-        # Repeated shutdown cancellation must not detach the cleanup supervisor.
-        while not task.done():
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                continue
-            except ModelLoadFailure:
-                break
-        # Retrieve a completed failure without leaking an unobserved task exception.
-        if task.done() and not task.cancelled():
-            error = task.exception()
-            if error is None:
-                # Cancellation can race a successfully completed bootstrap.
-                close_loaded_model(task.result())
-            elif isinstance(error, ModelLoadFailure) and error.reason == "cleanup_unverified":
-                raise error
-        raise
-
-
-@asynccontextmanager
-async def model_lifespan(app: FastAPI) -> AsyncIterator[None]:
-    configuration = read_mlflow_configuration()
-    app.state.mlflow_configuration = configuration
-    try:
-        for model_id, catalog_entry in MODEL_CATALOG.items():
-            logger.info("model_startup_attempt", extra={"model_id": model_id})
-            try:
-                loaded = await load_startup_model(
-                    catalog_entry, configuration, app.state.worker_pool
-                )
-                app.state.model_registry[model_id] = loaded
-            except ModelLoadFailure as error:
-                app.state.model_registry[model_id] = None
-                if error.reason == "cleanup_unverified":
-                    raise
-                logger.warning(
-                    "model_startup_failed", extra={"model_id": model_id, "reason": error.reason}
-                )
-            else:
-                logger.info("model_startup_succeeded", extra={"model_id": model_id})
-        yield
-    finally:
-        # The publication lock prevents a refresh from publishing after shutdown.
-        with app.state.model_registry_lock:
-            app.state.stopping = True
-            app.state.refresh_cancelled.set()
-            app.state.worker_pool.begin_shutdown()
-            app.state.model_registry = {model_id: None for model_id in MODEL_CATALOG}
-        failures = []
-        if app.state.model_refresh_lock.acquire(timeout=0.5):
-            app.state.model_refresh_lock.release()
-        else:
-            failures.append(ModelLoadFailure("cleanup_unverified"))
-        try:
-            app.state.worker_pool.close()
-        except ModelLoadFailure as error:
-            failures.append(error)
-        if failures:
-            raise ModelLoadFailure("cleanup_unverified")
-
-
-def close_loaded_model(loaded: LoadedModel) -> None:
-    if isinstance(loaded.model, ModelProxy):
-        loaded.model.close()
-
-
-def create_app() -> FastAPI:
-    application = FastAPI(
-        docs_url=None,
-        redoc_url=None,
-        openapi_url=None,
-        lifespan=model_lifespan,
-    )
-    application.state.model_registry = {model_id: None for model_id in MODEL_CATALOG}
-    application.state.model_registry_lock = Lock()
-    application.state.model_refresh_lock = Lock()
-    application.state.worker_pool = WorkerPool(3 * len(MODEL_CATALOG))
-    application.state.owned_workers = application.state.worker_pool.workers
-    application.state.stopping = False
-    application.state.refresh_cancelled = Event()
-    application.include_router(router)
-    return application
+    supplierName: SupplierName
+    amountPesos: AmountPesos
+    createdAt: datetime
+    businessStatus: BusinessStatus
 
 
 class PredictRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    invoice_amount_cents: int
-    vendor_tenure_days: int
-    previous_incidents_12m: int
-    amount_vs_vendor_median: float
-    has_purchase_order: bool
-    three_way_match: bool
-    bank_account_recently_changed: bool
-    country_risk: str
-
-    def as_training_features(self) -> list[object]:
-        return [
-            self.invoice_amount_cents,
-            self.vendor_tenure_days,
-            self.previous_incidents_12m,
-            self.amount_vs_vendor_median,
-            self.has_purchase_order,
-            self.three_way_match,
-            self.bank_account_recently_changed,
-            self.country_risk,
-        ]
-
-
-class PredictResponse(BaseModel):
-    model_id: str
-    model_version: str
-    run_id: str
-    probability: float
-
-
-class ModelHealthResponse(BaseModel):
-    model_id: str
-    registered_model: str
-    alias: str
-    model_version: str
-    run_id: str
-
-
-def active_model(request: Request, model_id: str) -> LoadedModel | None:
-    # A request snapshots one fully loaded model; inference continues on that instance.
-    with request.app.state.model_registry_lock:
-        loaded = request.app.state.model_registry[model_id]
-    # Availability can wait for cleanup; never nest that lock under publication.
-    if loaded is not None and isinstance(loaded.model, ModelProxy) and not loaded.model.available:
-        return None
-    return loaded
-
-
-@contextmanager
-def prediction_snapshot(request: Request, model_id: str):
-    with request.app.state.model_registry_lock:
-        loaded = request.app.state.model_registry[model_id]
-        if loaded is None:
-            raise HTTPException(status_code=503, detail="Model loader is unavailable")
-        proxy = loaded.model if isinstance(loaded.model, ModelProxy) else None
-        if proxy is not None:
-            try:
-                proxy.acquire()
-            except ModelLoadFailure:
-                raise HTTPException(
-                    status_code=503, detail="Model inference is unavailable"
-                ) from None
-    try:
-        yield loaded
-    finally:
-        if proxy is not None:
-            try:
-                proxy.release()
-            except ModelLoadFailure:
-                logger.error("model_cleanup_failed", extra={"reason": "cleanup_unverified"})
-                raise HTTPException(
-                    status_code=503, detail="Model inference is unavailable"
-                ) from None
-
-
-def model_health_response(model_id: str, loaded_model: LoadedModel) -> ModelHealthResponse:
-    catalog_entry = MODEL_CATALOG[model_id]
-    return ModelHealthResponse(
-        model_id=model_id,
-        registered_model=catalog_entry.registered_model,
-        alias=catalog_entry.alias,
-        model_version=loaded_model.model_version,
-        run_id=loaded_model.run_id,
+    invoice: InvoiceIn
+    prior_invoices: list[PriorInvoiceIn] = Field(
+        default_factory=list, alias="priorInvoices", max_length=10_000
     )
 
 
-def require_administrative_credential(request: Request) -> None:
-    provided_token = request.headers.get("X-Model-Admin-Token")
-    expected_token = request.app.state.mlflow_configuration.admin_token
-    if provided_token is None or not compare_digest(provided_token, expected_token):
-        raise HTTPException(status_code=401, detail="Administrative credentials are invalid")
+class BatchPredictRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[PredictRequest]
 
 
-def positive_class_probability(model: object, features: list[object]) -> float:
-    probabilities = model.predict_proba([features])
-    classes = list(model.classes_)
-    positive_class_index = classes.index(1)
-    rows = list(probabilities)
-    if len(rows) != 1:
-        raise ValueError("Model returned an unexpected number of predictions")
-    probability = float(list(rows[0])[positive_class_index])
-    if not isfinite(probability) or not 0 <= probability <= 1:
-        raise ValueError("Model returned an invalid probability")
-    return probability
+class BodyLimitMiddleware:
+    """Refuses request bodies over ``limit`` bytes (declared or streamed) with 413."""
 
+    def __init__(self, app: Callable[..., Awaitable[None]], limit: int) -> None:
+        self.app = app
+        self.limit = limit
 
-@router.get("/health")
-def health() -> dict[str, str]:
-    return {"status": "ok"}
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared = dict(scope["headers"]).get(b"content-length", b"")
+        if declared.isdigit() and int(declared) > self.limit:
+            await self._refuse(send)
+            return
+        total = 0
+        started = False
+        refused = False
 
+        async def limited_receive() -> Any:
+            nonlocal total, refused
+            message = await receive()
+            if message["type"] == "http.request":
+                total += len(message.get("body", b""))
+                if total > self.limit:
+                    # Answer 413 ourselves and tell the application the client is gone: the
+                    # framework would otherwise turn a failed body read into a 400.
+                    if not started and not refused:
+                        refused = True
+                        await self._refuse(send)
+                    return {"type": "http.disconnect"}
+            return message
 
-@router.get("/models")
-def list_models() -> dict[str, list[str]]:
-    return {"models": sorted(MODEL_CATALOG)}
+        async def guarded_send(message: Any) -> None:
+            nonlocal started
+            if refused:
+                return  # the 413 is already on the wire
+            started = True
+            await send(message)
 
+        await self.app(scope, limited_receive, guarded_send)
 
-@router.get("/models/{model_id}/health", response_model=ModelHealthResponse)
-def model_health(model_id: str, request: Request) -> ModelHealthResponse:
-    if model_id not in MODEL_CATALOG:
-        raise HTTPException(status_code=404, detail="Model not found")
-    loaded_model = active_model(request, model_id)
-    if loaded_model is None:
-        model = MODEL_CATALOG[model_id]
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "model_id": model_id,
-                "registered_model": model.registered_model,
-                "alias": model.alias,
-                "message": "Model loader is unavailable",
-            },
+    async def _refuse(self, send: Any) -> None:
+        body = json.dumps(
+            {"detail": {"code": "PAYLOAD_TOO_LARGE", "message": "Request body too large"}}
+        ).encode()
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 413,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ],
+            }
         )
-    return model_health_response(model_id, loaded_model)
+        await send({"type": "http.response.body", "body": body})
 
 
-@router.post("/admin/models/{model_id}/refresh", response_model=ModelHealthResponse)
-def refresh_model(model_id: str, request: Request) -> ModelHealthResponse:
-    require_administrative_credential(request)
-    if model_id not in MODEL_CATALOG:
-        raise HTTPException(status_code=404, detail="Model not found")
+KNOWN_METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"})
+UNMATCHED_ROUTE = "unmatched"
 
-    logger.info("model_refresh_attempt", extra={"model_id": model_id})
-    if not request.app.state.model_refresh_lock.acquire(blocking=False):
-        logger.warning(
-            "model_refresh_failed", extra={"model_id": model_id, "reason": "refresh_busy"}
-        )
-        raise HTTPException(status_code=503, detail="Model refresh is unavailable")
+
+class RequestCounters:
+    """Requests by route template and status (thread-safe, in-memory, reset on restart).
+
+    The key space is bounded whatever a client sends: unknown HTTP methods share ``OTHER`` and
+    every path that matches no route shares ``unmatched``.
+    """
+
+    def __init__(self) -> None:
+        self._counts: Counter[str] = Counter()
+        self._lock = threading.Lock()
+
+    def record(self, method: str, route: str, status: int) -> None:
+        method = method.upper()
+        if method not in KNOWN_METHODS:
+            method = "OTHER"
+        with self._lock:
+            self._counts[f"{method} {route or UNMATCHED_ROUTE} {status}"] += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return dict(sorted(self._counts.items()))
+
+
+def principal_hash(token: str, key: bytes) -> str:
+    """Non-reversible, log-safe identifier of the caller (the service credential).
+
+    HMAC-SHA-256 under ``Settings.audit_key`` (a dedicated key or one derived from the service
+    token, never a constant in the source), truncated to 64 bits: it correlates the requests of
+    one credential across log lines and reveals nothing usable about the secret.
+    """
+    return hmac.new(key, token.encode(), hashlib.sha256).hexdigest()[:16]
+
+
+def error(status: int, code: str, message: str, **extra: Any) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": message, **extra})
+
+
+def report(result: CheckResult, ref: ModelRef, run_id: str | None) -> dict[str, Any]:
+    return {
+        "passed": result.passed,
+        "reasons": [r.as_dict() for r in result.reasons],
+        "metrics": result.metrics,
+        "featureSchemaVersion": FEATURE_SCHEMA_VERSION,
+        "model": {
+            "workspace": ref.workspace,
+            "registeredModel": ref.registered_model,
+            "version": ref.version,
+            "runId": run_id,
+        },
+    }
+
+
+@dataclass
+class CheckOutcome:
+    result: CheckResult
+    run_id: str | None
+    slot: str | None = None  # staged artifact (only when requested and the check passed)
+    staged: Path | None = None
+
+
+def check_reference(
+    settings: Settings,
+    ref: ModelRef,
+    runner: CheckRunner,
+    supervisor: InferenceSupervisor | None = None,
+    gate: DownloadGate | None = None,
+) -> CheckOutcome:
+    """Download + validate one version. With ``supervisor``, a passing model's bytes are staged."""
     try:
-        try:
-            with request.app.state.model_registry_lock:
-                if request.app.state.stopping:
-                    raise ModelLoadFailure("cancelled")
-            loaded_model = load_model_in_isolated_process(
-                MODEL_CATALOG[model_id],
-                request.app.state.mlflow_configuration.tracking_uri,
-                request.app.state.mlflow_configuration.refresh_timeout_seconds,
-                load_model_from_mlflow,
-                cancelled=request.app.state.refresh_cancelled,
-                owner_pool=request.app.state.worker_pool,
-            )
-        except ModelLoadFailure as error:
-            logger.warning(
-                "model_refresh_failed",
-                extra={"model_id": model_id, "reason": error.reason},
-            )
-            raise HTTPException(status_code=503, detail="Model refresh is unavailable") from None
-        with request.app.state.model_registry_lock:
-            stopping = request.app.state.stopping
-            old = request.app.state.model_registry[model_id]
-            if not stopping:
-                request.app.state.model_registry[model_id] = loaded_model
-        if stopping:
+        validate_ref(ref)
+        with fetch_model(ref, settings, gate) as fetched:
+            result = run_check(fetched, settings, runner)
+            if result.passed and supervisor is not None:
+                slot, staged = supervisor.stage(fetched.skops_path)
+                return CheckOutcome(result, fetched.run_id, slot, staged)
+            return CheckOutcome(result, fetched.run_id)
+    except ArtifactError as e:
+        return CheckOutcome(CheckResult(False, [Reason(e.code, str(e), e.detail)]), None)
+    except DownloadBusy:
+        raise error(503, "BUSY", "Too many model downloads in progress; retry shortly") from None
+    except MlflowUnavailable:
+        raise error(502, "MLFLOW_UNAVAILABLE", "MLflow is unavailable") from None
+    except GateUnavailable:
+        raise error(503, "GATE_UNAVAILABLE", "The validation gate is not available") from None
+    except CheckBusy:
+        raise error(503, "BUSY", "Too many model checks in progress; retry shortly") from None
+    except OSError:
+        # Disk full / tmpfs exhausted / cannot spawn: the gate cannot run, so it fails closed.
+        logger.error("check_storage_unavailable id=%s", log_value(ref.registered_model))
+        raise error(
+            503, "CHECK_UNAVAILABLE", "The model check could not run; retry later"
+        ) from None
+
+
+def feature_row(item: PredictRequest) -> list[float]:
+    invoice = item.invoice.model_dump()
+    priors = [p.model_dump() for p in item.prior_invoices]
+    try:
+        features = compute_features(invoice, priors)
+    except (ValueError, OverflowError):
+        raise error(422, "INVALID_INVOICE", "Invoice or prior invoice fields are invalid") from None
+    return [float(features[f]) for f in FEATURES]
+
+
+ON_LINUX = sys.platform.startswith("linux")
+
+
+def apply_process_hardening() -> bool:
+    """Make this process non-dumpable so the secrets in its environment stay out of children's reach.
+
+    On Linux a False result means the protection is NOT active (the container then relies on the
+    other layers only): it is logged as an error and exposed as ``processHardened`` in /metrics.
+    """
+    applied = make_undumpable()
+    if not applied and ON_LINUX:
+        logger.error(
+            "process_hardening_failed prctl_set_dumpable=0 secrets_readable_by_children=true"
+        )
+    return applied
+
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    check_runner: CheckRunner | None = None,
+    supervisor: InferenceSupervisor | None = None,
+) -> FastAPI:
+    """Build the app. ``check_runner``/``supervisor`` are seams for tests (fault injection)."""
+    settings = settings or Settings.from_env()
+    configure_logging()  # INFO to stdout: audit, deploy_check and deployment_* lines
+    hardened = apply_process_hardening()
+    start_zombie_reaper()  # no-op unless this process is PID 1 (production: no docker-init)
+    registry = DeploymentRegistry(settings.max_deployments)
+    download_gate = DownloadGate(settings.max_concurrent_downloads, settings.download_wait_seconds)
+    counters = RequestCounters()
+    runner = check_runner or CheckRunner(settings)
+    supervisor = supervisor or InferenceSupervisor(settings)
+    supervisor.on_quarantine = registry.quarantine
+    audit_key = settings.audit_key
+    # Deploy checks and loads block (download, check child, activation). They run on their OWN
+    # bounded pool, never on the default threadpool that serves /predict, and at most
+    # ``2 x workers`` of them are admitted at once; the rest get 503 BUSY immediately.
+    workers = max(2, settings.max_concurrent_checks + settings.max_concurrent_downloads + 2)
+    check_executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="check")
+    admission = threading.BoundedSemaphore(workers * 2)
+
+    async def offload(function: Callable[..., Any], *args: Any) -> Any:
+        if not admission.acquire(blocking=False):
+            raise error(503, "BUSY", "Too many model checks in progress; retry shortly")
+
+        def guarded() -> Any:
             try:
-                close_loaded_model(loaded_model)
-            except ModelLoadFailure:
-                logger.error("model_cleanup_failed", extra={"reason": "cleanup_unverified"})
-            raise HTTPException(status_code=503, detail="Model refresh is unavailable")
-        if old is not None and isinstance(old.model, ModelProxy):
-            old.model.retire()
-        logger.info("model_refresh_succeeded", extra={"model_id": model_id})
-    finally:
-        request.app.state.model_refresh_lock.release()
-    return model_health_response(model_id, loaded_model)
+                return function(*args)
+            finally:
+                admission.release()
 
-
-@router.post("/models/{model_id}/predict", response_model=PredictResponse)
-def predict(model_id: str, request: PredictRequest, app_request: Request) -> PredictResponse:
-    if model_id not in MODEL_CATALOG:
-        raise HTTPException(status_code=404, detail="Model not found")
-    with prediction_snapshot(app_request, model_id) as loaded_model:
         try:
-            probability = positive_class_probability(
-                loaded_model.model, request.as_training_features()
-            )
-        except Exception:  # noqa: BLE001
-            raise HTTPException(status_code=503, detail="Model inference is unavailable") from None
-        return PredictResponse(
-            model_id=model_id,
-            model_version=loaded_model.model_version,
-            run_id=loaded_model.run_id,
-            probability=probability,
+            future = check_executor.submit(guarded)
+        except BaseException:
+            admission.release()
+            raise
+        return await asyncio.wrap_future(future)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        yield
+        check_executor.shutdown(wait=False, cancel_futures=True)
+        supervisor.shutdown()
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app.state.settings = settings
+    app.state.registry = registry
+    app.state.supervisor = supervisor
+    app.state.counters = counters
+    app.state.process_hardened = hardened
+    app.state.check_executor = check_executor
+    app.add_middleware(BodyLimitMiddleware, limit=settings.max_body_bytes)
+    atexit.register(supervisor.shutdown)  # also covers processes without a lifespan (tests)
+
+    @app.exception_handler(RequestValidationError)
+    async def validation_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+        # Never echo the submitted values (they may be invoice data).
+        issues = [
+            {
+                "loc": [str(p) for p in e["loc"]],
+                "type": e["type"],
+                **({"message": e["msg"]} if e["type"] in SAFE_ERROR_MESSAGES else {}),
+            }
+            for e in exc.errors()
+        ]
+        return JSONResponse(
+            status_code=422, content={"detail": {"code": "INVALID_REQUEST", "issues": issues}}
         )
 
+    def require_service(request: Request) -> None:
+        header = request.headers.get("authorization", "")
+        scheme, _, token = header.partition(" ")
+        expected = settings.service_token
+        if (
+            len(expected) < 32
+            or scheme.lower() != "bearer"
+            or not compare_digest(token.encode(), expected.encode())
+        ):
+            raise HTTPException(status_code=401, detail={"code": "UNAUTHORIZED"})
 
-app = create_app()
+    @app.middleware("http")
+    async def observe(request: Request, call_next: Callable[[Request], Awaitable[Any]]) -> Any:
+        status = 500  # what an unhandled exception becomes; replaced once a response exists
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            route = request.scope.get("route")
+            template = getattr(route, "path", UNMATCHED_ROUTE)
+            counters.record(request.method, template, status)
+            if request.method in MUTATING_METHODS:
+                # Audit trail of mutations: who (non-reversible digest), what, outcome.
+                header = request.headers.get("authorization", "")
+                token = header.partition(" ")[2]
+                who = principal_hash(token, audit_key) if status != 401 and token else "anonymous"
+                logger.info(
+                    "audit principal=%s method=%s route=%s status=%s",
+                    who,
+                    request.method,
+                    template,
+                    status,
+                )
+
+    router = APIRouter(dependencies=[Depends(require_service)])
+
+    @app.get("/health")
+    async def liveness() -> dict[str, str]:
+        # async on purpose: it runs on the event loop, never behind the (possibly exhausted)
+        # worker thread pool that serves the blocking routes.
+        return {"status": "ok"}
+
+    @router.get("/metrics")
+    def metrics() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "processHardened": hardened,
+            "requests": counters.snapshot(),
+        }
+
+    @router.get("/deployments")
+    def list_deployments() -> dict[str, Any]:
+        items = registry.list()
+        return {
+            "status": "ok",
+            "featureSchemaVersion": FEATURE_SCHEMA_VERSION,
+            "capacity": registry.capacity,
+            "loaded": len(items),
+            "deployments": [d.summary() for d in items],
+            "quarantined": registry.quarantined(),
+        }
+
+    @router.post("/deploy-check")
+    async def deploy_check(body: ModelReference) -> dict[str, Any]:
+        return await offload(run_deploy_check, body)
+
+    def run_deploy_check(body: ModelReference) -> dict[str, Any]:
+        ref = body.to_ref()
+        checked = check_reference(settings, ref, runner, gate=download_gate)
+        result, run_id = checked.result, checked.run_id
+        logger.info(
+            "deploy_check model=%s version=%s passed=%s codes=%s",
+            log_value(ref.registered_model),
+            ref.version,
+            result.passed,
+            [r.code for r in result.reasons],
+        )
+        return report(result, ref, run_id)
+
+    @router.put("/deployments/{deployment_id}")
+    async def load_deployment(deployment_id: DeploymentId, body: ModelReference) -> dict[str, Any]:
+        return await offload(run_load_deployment, deployment_id, body)
+
+    def run_load_deployment(deployment_id: str, body: ModelReference) -> dict[str, Any]:
+        ref = body.to_ref()
+        if not registry.has_room_for(deployment_id):
+            raise error(
+                409,
+                "CAPACITY_EXCEEDED",
+                "Maximum loaded deployments reached",
+                capacity=registry.capacity,
+            )
+        existing = registry.get(deployment_id)
+        if existing is not None and existing.ref == ref:
+            return existing.summary()
+        checked = check_reference(settings, ref, runner, supervisor, download_gate)
+        try:
+            return activate_checked(deployment_id, ref, checked)
+        except BaseException:
+            # Every failure path (gate failed, worker unavailable, capacity, anything unexpected)
+            # removes the staged bytes: a failed deploy never leaves a .skops file in the cache.
+            if checked.slot is not None and checked.staged is not None:
+                supervisor.unload(checked.slot, checked.staged)
+            raise
+
+    def activate_checked(
+        deployment_id: str, ref: ModelRef, checked: CheckOutcome
+    ) -> dict[str, Any]:
+        result, run_id = checked.result, checked.run_id
+        if (
+            not result.passed
+            or run_id is None
+            or checked.slot is None
+            or checked.staged is None
+            or result.columns is None
+        ):
+            raise HTTPException(
+                status_code=422, detail={"code": "GATE_FAILED", **report(result, ref, run_id)}
+            )
+        slot, staged = checked.slot, checked.staged
+        loaded = LoadedDeployment(
+            deployment_id=deployment_id,
+            ref=ref,
+            run_id=run_id,
+            slot=slot,
+            artifact_path=staged,
+            columns=tuple(result.columns),
+            positive_index=result.positive_index,
+            metrics=result.metrics or {},
+            loaded_at=now_iso(),
+        )
+        try:
+            # Load into the inference worker BEFORE publishing; the old model keeps serving.
+            supervisor.activate(slot, staged, loaded.columns)
+        except (InferenceUnavailable, InferenceFailed):
+            raise error(503, "INFERENCE_UNAVAILABLE", "The model could not be activated") from None
+        try:
+            replaced = registry.put(loaded)  # replaces atomically; the old model served until now
+        except CapacityExceeded:
+            raise error(
+                409,
+                "CAPACITY_EXCEEDED",
+                "Maximum loaded deployments reached",
+                capacity=registry.capacity,
+            ) from None
+        if replaced is not None:
+            supervisor.unload(replaced.slot, replaced.artifact_path)
+        logger.info(
+            "deployment_loaded id=%s model=%s version=%s",
+            deployment_id,
+            log_value(ref.registered_model),
+            ref.version,
+        )
+        return loaded.summary()
+
+    @router.delete("/deployments/{deployment_id}")
+    def unload_deployment(deployment_id: DeploymentId) -> dict[str, Any]:
+        removed = registry.remove(deployment_id)
+        if removed is not None:
+            supervisor.unload(removed.slot, removed.artifact_path)
+        logger.info("deployment_unloaded id=%s removed=%s", deployment_id, removed is not None)
+        return {"deploymentId": deployment_id, "unloaded": removed is not None}
+
+    def score(
+        deployment: LoadedDeployment, items: list[PredictRequest]
+    ) -> tuple[LoadedDeployment, list[float]]:
+        """Score ``items``; returns the deployment that actually served them.
+
+        A request that raced a redeploy of the same ``deploymentId`` can hold a slot that was just
+        replaced (and unloaded). It is retried ONCE against the current slot instead of
+        failing with a 503 for a deployment that is, in fact, loaded.
+        """
+        for item in items:
+            if len(item.prior_invoices) > settings.max_prior_invoices:
+                raise error(
+                    422,
+                    "TOO_MANY_PRIORS",
+                    "Too many prior invoices",
+                    max=settings.max_prior_invoices,
+                )
+        if sum(len(item.prior_invoices) for item in items) > settings.max_total_priors:
+            raise error(
+                422,
+                "TOO_MANY_PRIORS",
+                "Too many prior invoices in the request",
+                max=settings.max_total_priors,
+            )
+        rows = [feature_row(item) for item in items]
+        try:
+            try:
+                return deployment, supervisor.predict(deployment.slot, rows)
+            except InferenceUnavailable:
+                current = registry.get(deployment.deployment_id)
+                if current is None or current.slot == deployment.slot:
+                    raise
+                logger.info("predict_retry_on_replaced_slot id=%s", deployment.deployment_id)
+                return current, supervisor.predict(current.slot, rows)
+        except InferenceUnavailable as unavailable:
+            logger.error("inference_unavailable id=%s", deployment.deployment_id)
+            raise error(
+                503,
+                "INFERENCE_UNAVAILABLE",
+                "The inference worker is unavailable; retry shortly",
+                **({"quarantined": True} if unavailable.quarantined else {}),
+            ) from None
+        except InferenceFailed:
+            logger.error("inference_failed id=%s", deployment.deployment_id)
+            raise error(503, "INFERENCE_FAILED", "Model inference failed") from None
+
+    def prediction_payload(deployment: LoadedDeployment) -> dict[str, Any]:
+        return {
+            "deploymentId": deployment.deployment_id,
+            "workspace": deployment.ref.workspace,
+            "registeredModel": deployment.ref.registered_model,
+            "modelVersion": deployment.ref.version,
+            "runId": deployment.run_id,
+            "featureSchemaVersion": FEATURE_SCHEMA_VERSION,
+        }
+
+    def get_loaded(deployment_id: str) -> LoadedDeployment:
+        deployment = registry.get(deployment_id)
+        if deployment is None:
+            raise error(404, "DEPLOYMENT_NOT_LOADED", "Deployment is not loaded")
+        return deployment
+
+    @router.post("/deployments/{deployment_id}/predict")
+    def predict(deployment_id: DeploymentId, body: PredictRequest) -> dict[str, Any]:
+        deployment = get_loaded(deployment_id)
+        deployment, (probability,) = score(deployment, [body])
+        return {**prediction_payload(deployment), "probability": probability}
+
+    @router.post("/deployments/{deployment_id}/predict-batch")
+    def predict_batch(deployment_id: DeploymentId, body: BatchPredictRequest) -> dict[str, Any]:
+        deployment = get_loaded(deployment_id)
+        if not body.items or len(body.items) > settings.max_batch_items:
+            raise error(
+                422, "INVALID_BATCH_SIZE", "Batch size out of range", max=settings.max_batch_items
+            )
+        deployment, probabilities = score(deployment, body.items)
+        return {**prediction_payload(deployment), "probabilities": probabilities}
+
+    app.include_router(router)
+    return app
+
+
+def _default_app() -> FastAPI:
+    return create_app()
+
+
+def __getattr__(name: str) -> Any:
+    # ``uvicorn invoiceops_model_api.app:app`` builds the app lazily, from the environment,
+    # so importing this module (tests, tooling) never requires secrets.
+    if name == "app":
+        application = _default_app()
+        globals()["app"] = application
+        return application
+    raise AttributeError(name)

@@ -1,0 +1,7 @@
+# Standalone definition of the shared network that compose.production.yml references (`api`).
+# Needed only when this repository is run WITHOUT invoiceops-stack. In the unified stack the app's
+# compose.production.yml defines it (and creates it) instead.
+networks:
+  api:
+    external: true
+    name: ${INVOICEOPS_API_NETWORK:-invoiceops_api}

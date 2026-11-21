@@ -14,14 +14,47 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  # invoiceops-ml is a public repository and a uv path source of this project (../invoiceops-ml).
+  # It is checked out next to this repository at a PINNED ref: a full commit SHA (preferred: it is
+  # immutable) or a release tag such as v0.2.0 (allowed, but a tag can be moved or re-created, so
+  # prefer the SHA it points to), never a branch. Set the repository variable INVOICEOPS_ML_REF to
+  # the ref whose version matches uv.lock; the first step of each job refuses anything else, so a
+  # moving `main` can never change what CI tests or what the image contains.
+  INVOICEOPS_ML_REPOSITORY: yieniggu/invoiceops-ml
+  INVOICEOPS_ML_REF: ${{ vars.INVOICEOPS_ML_REF }}
+
 jobs:
   checks:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: invoiceops-model-api
     steps:
+      - name: Require a pinned invoiceops-ml ref (commit SHA or vX.Y.Z tag)
+        working-directory: .
+        run: |
+          case "$INVOICEOPS_ML_REF" in
+            *[!0-9a-f]* | "") ;;
+            *) [ "${#INVOICEOPS_ML_REF}" -eq 40 ] && exit 0 ;;
+          esac
+          case "$INVOICEOPS_ML_REF" in
+            v[0-9]*.[0-9]*.[0-9]*) exit 0 ;;
+          esac
+          echo "INVOICEOPS_ML_REF must be a 40-character commit SHA or a vX.Y.Z tag" >&2
+          exit 1
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          path: invoiceops-model-api
+          persist-credentials: false
+      - name: Check out invoiceops-ml alongside
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.INVOICEOPS_ML_REPOSITORY }}
+          ref: ${{ env.INVOICEOPS_ML_REF }}
+          path: invoiceops-ml
           persist-credentials: false
       - name: Set up uv and Python 3.12
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -39,5 +72,62 @@ jobs:
         run: uv run --locked --no-sync pytest
       - name: Lint source and tests
         run: uv run --locked --no-sync ruff check .
+      - name: Check formatting
+        run: uv run --locked --no-sync ruff format --check .
       - name: Build source and wheel distributions
         run: uv build
+
+  image:
+    name: Container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Require a pinned invoiceops-ml ref (commit SHA or vX.Y.Z tag)
+        working-directory: .
+        run: |
+          case "$INVOICEOPS_ML_REF" in
+            *[!0-9a-f]* | "") ;;
+            *) [ "${#INVOICEOPS_ML_REF}" -eq 40 ] && exit 0 ;;
+          esac
+          case "$INVOICEOPS_ML_REF" in
+            v[0-9]*.[0-9]*.[0-9]*) exit 0 ;;
+          esac
+          echo "INVOICEOPS_ML_REF must be a 40-character commit SHA or a vX.Y.Z tag" >&2
+          exit 1
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: invoiceops-model-api
+          persist-credentials: false
+      - name: Check out invoiceops-ml alongside
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.INVOICEOPS_ML_REPOSITORY }}
+          ref: ${{ env.INVOICEOPS_ML_REF }}
+          path: invoiceops-ml
+          persist-credentials: false
+      - name: Build with the "ml" build context
+        working-directory: invoiceops-model-api
+        run: docker build --build-context ml=../invoiceops-ml --tag invoiceops-model-api:ci .
+      - name: Set up uv and Python 3.12 for the container tests
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: '0.12.5'
+          python-version: '3.12'
+          enable-cache: false
+      - name: Container test, production flags (uvicorn is PID 1, children cannot read its environment)
+        working-directory: invoiceops-model-api
+        env:
+          MODEL_API_TEST_IMAGE: invoiceops-model-api:ci
+        run: |
+          uv sync --locked --all-groups
+          uv run --locked --no-sync pytest -q tests/test_container_pid1.py tests/test_container_logs.py
+      - name: Validate the production compose file with dummy values
+        working-directory: invoiceops-model-api
+        env:
+          MODEL_API_SERVICE_TOKEN: ci-service-token-0123456789abcdef0123
+          OFFICIAL_VALIDATION_SEED: ci-validation-seed-0123456789abcdef0123
+          GATEWAY_SERVICE_READ_TOKEN: ci-gateway-read-token-0123456789abcdef
+        run: |
+          docker network create invoiceops_api
+          docker compose -f compose.production.yml -f compose.networks.yml config -q

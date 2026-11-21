@@ -1,0 +1,89 @@
+# Production deployment of the Model API (MLOPS-07). In production this file is consumed by
+# invoiceops-stack (`include:` in its compose.yml; see its README, "Levantar todo"), which brings up
+# the app, MLflow + gateway and this service as ONE compose project. Same pattern as the app: no
+# published host ports; the service only REFERENCES the network `api` (invoiceops_api), which the
+# app's compose.production.yml defines. To use this file alone, add compose.networks.yml:
+#
+#   docker compose --env-file /opt/invoiceops/invoiceops.env -f compose.production.yml -f compose.networks.yml build
+#
+# Network: it joins ONLY `api` (invoiceops_api). The backend reaches it as
+# http://invoiceops-model-api:8000 and it reaches MLflow data through the gateway
+# (http://invoiceops-mlflow-gateway:8080, read-only service token). It is not on the tunnel
+# network (aglai_edge), so nothing outside docker can route to it.
+name: invoiceops-model-api
+
+services:
+  model-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # The shared package lives in a sibling checkout (path source in pyproject.toml/uv.lock).
+      additional_contexts:
+        # Server layout: /opt/invoiceops/{model-api,ml}. Locally set INVOICEOPS_ML_CONTEXT=../invoiceops-ml.
+        ml: ${INVOICEOPS_ML_CONTEXT:-../ml}
+    image: invoiceops-model-api:${MODEL_API_VERSION:-latest}
+    environment:
+      MODEL_API_SERVICE_TOKEN: ${MODEL_API_SERVICE_TOKEN:?MODEL_API_SERVICE_TOKEN is required (>= 32 chars)}
+      OFFICIAL_VALIDATION_SEED: ${OFFICIAL_VALIDATION_SEED:?OFFICIAL_VALIDATION_SEED is required (openssl rand -hex 32)}
+      MLFLOW_TRACKING_URI: ${MODEL_API_MLFLOW_URI:-http://invoiceops-mlflow-gateway:8080}
+      MODEL_API_MLFLOW_AUTH: gateway
+      GATEWAY_SERVICE_READ_TOKEN: ${GATEWAY_SERVICE_READ_TOKEN:?GATEWAY_SERVICE_READ_TOKEN is required (>= 32 chars)}
+      HOME: /tmp
+      # Optional bounds, one line per variable read by settings.py (tests/test_compose_env_contract.py
+      # keeps this list equal to settings.py, model-api.env.example and the README). `:-` with an
+      # empty default means "unset": the service then applies its own default.
+      MODEL_API_AUDIT_HMAC_KEY: ${MODEL_API_AUDIT_HMAC_KEY:-}
+      GATE_MIN_AUC: ${GATE_MIN_AUC:-}
+      GATE_MIN_LIFT: ${GATE_MIN_LIFT:-}
+      OFFICIAL_VALIDATION_ROWS: ${OFFICIAL_VALIDATION_ROWS:-}
+      MAX_LOADED_DEPLOYMENTS: ${MAX_LOADED_DEPLOYMENTS:-}
+      MAX_MODEL_BYTES: ${MAX_MODEL_BYTES:-}
+      MAX_BODY_BYTES: ${MAX_BODY_BYTES:-}
+      MAX_TOTAL_PRIORS: ${MAX_TOTAL_PRIORS:-}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-}
+      MODEL_API_MLFLOW_MAX_RETRIES: ${MODEL_API_MLFLOW_MAX_RETRIES:-}
+      MODEL_API_MLFLOW_TIMEOUT_SECONDS: ${MODEL_API_MLFLOW_TIMEOUT_SECONDS:-}
+      MODEL_API_MLFLOW_BUDGET_SECONDS: ${MODEL_API_MLFLOW_BUDGET_SECONDS:-}
+      MODEL_CHECK_TIMEOUT_SECONDS: ${MODEL_CHECK_TIMEOUT_SECONDS:-}
+      MODEL_CHECK_CONCURRENCY: ${MODEL_CHECK_CONCURRENCY:-}
+      MODEL_CHECK_WAIT_SECONDS: ${MODEL_CHECK_WAIT_SECONDS:-}
+      MODEL_INFERENCE_TIMEOUT_SECONDS: ${MODEL_INFERENCE_TIMEOUT_SECONDS:-}
+      # Address-space limits stay below mem_limit (tests/test_container_config.py checks it).
+      MODEL_CHECK_MEMORY_MB: ${MODEL_CHECK_MEMORY_MB:-1024}
+      MODEL_WORKER_MEMORY_MB: ${MODEL_WORKER_MEMORY_MB:-1024}
+    # Limits measured in a Linux container (README, "Memory (measured)"): HTTP process ~130-300 MB,
+    # worker ~310 MB with 30 deployments, check child ~230 MB, plus a candidate worker while a model
+    # is activated. 2g is a cgroup limit (docker compose, not swarm); the children's RLIMIT_AS is
+    # aligned below it (1024 MB each, 2x the 512 MB at which every measured model still works).
+    mem_limit: 2g
+    # Threads count as pids: the request thread pool (40) + event loop + children and their BLAS
+    # threads stay well under this; a fork bomb in a child hits it before the host.
+    pids_limit: 256
+    # NO `init: true` (see README): docker-init would become PID 1 with the FULL environment (service
+    # token, validation seed, gateway token), readable through /proc/1/environ by any child of the
+    # same user. uvicorn is PID 1 instead: it calls prctl(PR_SET_DUMPABLE, 0) (procutil.make_undumpable)
+    # and runs a bounded zombie reaper (procutil.start_zombie_reaper) for the orphans of killed
+    # children. tests/test_container_config.py fails if `init` is enabled while secrets are set.
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Nothing is written outside /tmp: the verified model cache and the downloads live in a tmpfs
+    # (memory-backed, so it counts towards mem_limit; a full tmpfs makes a deploy fail closed).
+    read_only: true
+    tmpfs:
+      - /tmp:size=768m,mode=1777
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).close()",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    networks:
+      api:
+        aliases: [invoiceops-model-api]
+    restart: unless-stopped
